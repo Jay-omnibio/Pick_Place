@@ -1,4 +1,5 @@
 import time
+import os
 
 # Simulator
 from env.simulator import MujocoSimulator
@@ -16,6 +17,7 @@ def main():
     # ------------------------------------------------
     MODEL_XML_PATH = "assets/pick_and_place.xml"
     SENSOR_CONFIG_PATH = "config/sensor_config.yaml"
+    LOG_EVERY_STEPS = int(os.getenv("LOG_EVERY_STEPS", "20"))
 
     # ------------------------------------------------
     # Create simulator
@@ -36,7 +38,8 @@ def main():
     agent = ActiveInferenceAgent(
         simulator=simulator,
         controller=controller,
-        sensor_config_path=SENSOR_CONFIG_PATH
+        sensor_config_path=SENSOR_CONFIG_PATH,
+        log_every_steps=LOG_EVERY_STEPS,
     )
 
     # ------------------------------------------------
@@ -44,6 +47,7 @@ def main():
     # ------------------------------------------------
     print("Starting Active Inference Pick-and-Place demo...")
     print("Press Ctrl+C to stop.")
+    print(f"Console log frequency: every {LOG_EVERY_STEPS} steps")
 
     try:
         while True:
@@ -53,6 +57,9 @@ def main():
 
     except KeyboardInterrupt:
         print("\nSimulation stopped by user.")
+    finally:
+        agent.close()
+        print(f"Saved run log: {agent.log_csv_path}")
 
 
 if __name__ == "__main__":

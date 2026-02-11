@@ -6,7 +6,9 @@ using Distributions
 # ------------------------------------------------
 
 const LAMBDA_EPISTEMIC = 0.1   # curiosity weight
-const DELTA = 0.05            # step size for EE movement
+const DELTA = 0.01             # step size for EE movement
+const REACH_OBJ_REL = [0.0, 0.0, -0.08]
+const ACTION_EFFECTIVENESS = 0.4
 
 # ------------------------------------------------
 # Action definitions
@@ -104,14 +106,16 @@ function predict_next_belief(current_belief, action)
     s_obj_mean = current_belief[:s_obj_mean]
     s_target_mean = current_belief[:s_target_mean]
 
+    effective_move = ACTION_EFFECTIVENESS * action.move
+
     # EE update
-    next_s_ee = s_ee_mean + action.move
+    next_s_ee = s_ee_mean + effective_move
 
     # Object relative update (free object assumption)
-    next_s_obj = s_obj_mean - (next_s_ee - s_ee_mean)
+    next_s_obj = s_obj_mean - effective_move
 
     # Target relative update
-    next_s_target = s_target_mean - (next_s_ee - s_ee_mean)
+    next_s_target = s_target_mean - effective_move
 
     # Covariances grow slightly (uncertainty propagation)
     base_obj_cov = current_belief[:s_obj_cov]
@@ -137,12 +141,27 @@ Select the action that minimizes Expected Free Energy.
 """
 function select_action(current_belief)
 
+    phase = current_belief[:phase]
+
+    # Phase-specific control to mirror stable scripted behavior.
+    if phase == :Reach
+        s_obj = current_belief[:s_obj_mean]
+        desired_move = s_obj - REACH_OBJ_REL
+        n = norm(desired_move)
+        if n > DELTA && n > 0.0
+            desired_move = (desired_move / n) * DELTA
+        end
+        return (move = desired_move, grip = 0)
+    elseif phase == :Grasp
+        return (move = [0.0, 0.0, 0.0], grip = 1)
+    elseif phase == :Lift
+        return (move = [0.0, 0.0, DELTA], grip = 1)
+    end
+
     candidate_actions = generate_candidate_actions()
 
     best_action = nothing
     best_G = Inf
-
-    phase = current_belief[:phase]
 
     for action in candidate_actions
         predicted_belief = predict_next_belief(current_belief, action)

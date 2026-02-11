@@ -52,10 +52,13 @@ class EEController:
         if norm > self.max_step:
             delta = delta / norm * self.max_step
 
-        # Get current EE pose
-        ee_pos = self.simulator.get_ee_position()
+        # Integrate commands in mocap space; EE can lag behind weld tracking.
+        if hasattr(self.simulator, "get_mocap_position"):
+            base_pos = self.simulator.get_mocap_position()
+        else:
+            base_pos = self.simulator.get_ee_position()
 
-        target_pos = ee_pos + delta
+        target_pos = base_pos + delta
 
         # Safety: avoid going below table
         target_pos[2] = max(target_pos[2], self.min_height)
