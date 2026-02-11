@@ -37,9 +37,13 @@ class MujocoSimulator:
             self.model.jnt_qposadr[self.gripper_joints[0]],
             self.model.jnt_qposadr[self.gripper_joints[1]],
         ]
-        self.mocap_tracking_gain = 0.35
-        self.ee_feedback_gain = 0.20
-        self.max_mocap_step = 0.03
+        # Conservative tracking parameters to avoid dynamic blowups.
+        self.mocap_tracking_gain = 0.20
+        self.ee_feedback_gain = 0.10
+        self.max_mocap_step = 0.008
+        self.max_ee_feedback_err = 0.12
+        self.workspace_min = np.array([0.05, -0.50, 0.08], dtype=float)
+        self.workspace_max = np.array([0.85, 0.50, 0.95], dtype=float)
 
         # Initial settle
         for _ in range(50):
@@ -69,8 +73,31 @@ class MujocoSimulator:
     def step(self, steps=1):
         for _ in range(steps):
             mujoco.mj_step(self.model, self.data)
+            if not self._is_dynamics_finite():
+                self._recover_from_instability()
             if self.viewer:
                 self.viewer.sync()
+
+    def _is_dynamics_finite(self):
+        return (
+            np.all(np.isfinite(self.data.qpos))
+            and np.all(np.isfinite(self.data.qvel))
+            and np.all(np.isfinite(self.data.qacc))
+        )
+
+    def _recover_from_instability(self):
+        """
+        Best-effort recovery when MuJoCo reports unstable dynamics.
+        Keeps current pose, zeroes velocities, and re-anchors mocap to EE.
+        """
+        if not np.all(np.isfinite(self.data.qpos)):
+            mujoco.mj_resetData(self.model, self.data)
+        self.data.qvel[:] = 0.0
+        self.data.qacc[:] = 0.0
+        self.data.qacc_warmstart[:] = 0.0
+        ee_pos = self.get_ee_position()
+        self.data.mocap_pos[self.mocap_id] = np.clip(ee_pos, self.workspace_min, self.workspace_max)
+        mujoco.mj_forward(self.model, self.data)
 
     # ------------------------------------------------
     # State access (GROUND TRUTH — internal only)
@@ -105,19 +132,24 @@ class MujocoSimulator:
         Simple mocap-based EE positioning.
         """
         target_pos = np.array(target_pos, dtype=float)
+        target_pos = np.clip(target_pos, self.workspace_min, self.workspace_max)
         current_mocap = self.get_mocap_position()
         current_ee = self.get_ee_position()
 
         # Blend mocap-target tracking with EE feedback so weld lag does not invert behavior.
         mocap_err = target_pos - current_mocap
         ee_err = target_pos - current_ee
+        ee_err_norm = np.linalg.norm(ee_err)
+        if ee_err_norm > self.max_ee_feedback_err and ee_err_norm > 0:
+            ee_err = (ee_err / ee_err_norm) * self.max_ee_feedback_err
         step = self.mocap_tracking_gain * mocap_err + self.ee_feedback_gain * ee_err
 
         step_norm = np.linalg.norm(step)
         if step_norm > self.max_mocap_step:
             step = (step / step_norm) * self.max_mocap_step
 
-        self.data.mocap_pos[self.mocap_id] = current_mocap + step
+        next_mocap = np.clip(current_mocap + step, self.workspace_min, self.workspace_max)
+        self.data.mocap_pos[self.mocap_id] = next_mocap
         mujoco.mj_forward(self.model, self.data)
 
     # ------------------------------------------------

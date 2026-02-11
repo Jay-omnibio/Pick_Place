@@ -146,6 +146,8 @@ def _select_action_python(current_belief):
     LAMBDA_EPISTEMIC = 0.1
     DELTA = 0.01
     REACH_OBJ_REL = np.array([0.0, 0.0, -0.08])
+    XY_ALIGN_THRESHOLD = 0.04
+    XY_BLEND_FLOOR = 0.25
 
     # Generate candidate actions
     moves = [
@@ -171,8 +173,16 @@ def _select_action_python(current_belief):
     # Phase-specific control to match stable scripted behavior.
     if phase == "Reach" or phase == 1:
         s_obj = np.array(current_belief.get("s_obj_mean", [0, 0, 0]), dtype=float)
-        # s_obj_next = s_obj - move  => choose move to drive s_obj toward desired relative offset.
-        desired_move = s_obj - REACH_OBJ_REL
+        err = s_obj - REACH_OBJ_REL
+        xy_err_norm = float(np.linalg.norm(err[:2]))
+
+        # Adaptive blend:
+        # - large XY error => mostly XY correction
+        # - small XY error => allow stronger Z correction
+        # Keeps some Z authority in all cases to avoid hard-mode switching stalls.
+        z_weight = min(1.0, max(XY_BLEND_FLOOR, 1.0 - (xy_err_norm / XY_ALIGN_THRESHOLD)))
+        desired_move = np.array([err[0], err[1], z_weight * err[2]], dtype=float)
+
         norm = np.linalg.norm(desired_move)
         if norm > DELTA and norm > 0:
             desired_move = (desired_move / norm) * DELTA

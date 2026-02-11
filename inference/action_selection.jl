@@ -9,6 +9,8 @@ const LAMBDA_EPISTEMIC = 0.1   # curiosity weight
 const DELTA = 0.01             # step size for EE movement
 const REACH_OBJ_REL = [0.0, 0.0, -0.08]
 const ACTION_EFFECTIVENESS = 0.4
+const XY_ALIGN_THRESHOLD = 0.04
+const XY_BLEND_FLOOR = 0.25
 
 # ------------------------------------------------
 # Action definitions
@@ -146,7 +148,10 @@ function select_action(current_belief)
     # Phase-specific control to mirror stable scripted behavior.
     if phase == :Reach
         s_obj = current_belief[:s_obj_mean]
-        desired_move = s_obj - REACH_OBJ_REL
+        err = s_obj - REACH_OBJ_REL
+        xy_err_norm = norm(err[1:2])
+        z_weight = min(1.0, max(XY_BLEND_FLOOR, 1.0 - (xy_err_norm / XY_ALIGN_THRESHOLD)))
+        desired_move = [err[1], err[2], z_weight * err[3]]
         n = norm(desired_move)
         if n > DELTA && n > 0.0
             desired_move = (desired_move / n) * DELTA

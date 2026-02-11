@@ -38,6 +38,17 @@ def _as_str_array(rows, key):
     return np.array([str(r[key]) for r in rows], dtype=object)
 
 
+def _as_optional_int_array(rows, key, default=0):
+    values = []
+    for r in rows:
+        v = r.get(key, "")
+        if v == "" or v is None:
+            values.append(default)
+        else:
+            values.append(int(float(v)))
+    return np.array(values, dtype=int)
+
+
 def _save_fig(path: Path):
     plt.tight_layout()
     plt.savefig(path, dpi=150)
@@ -86,6 +97,7 @@ def main():
 
     obs_contact = _as_int_array(rows, "obs_contact")
     obs_grip = _as_float_array(rows, "obs_grip")
+    escape_active = _as_optional_int_array(rows, "escape_active", default=0)
 
     phase_map = {p: i for i, p in enumerate(sorted(set(phase)))}
     phase_idx = np.array([phase_map[p] for p in phase], dtype=int)
@@ -151,6 +163,7 @@ def main():
     plt.figure(figsize=(10, 4))
     plt.step(step, phase_idx, where="post", label="phase")
     plt.step(step, obs_contact, where="post", label="obs_contact")
+    plt.step(step, escape_active, where="post", label="escape_active")
     plt.plot(step, obs_grip, label="obs_grip")
     plt.yticks(list(phase_map.values()), list(phase_map.keys()))
     plt.xlabel("Step")

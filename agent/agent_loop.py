@@ -36,6 +36,12 @@ class ActiveInferenceAgent:
 
         self.obs_history = deque(maxlen=50)
         self.action_history = deque(maxlen=50)
+        self.ee_true_history = deque(maxlen=120)
+        self.escape_cooldown = 0
+        self.escape_active = 0
+        self.stall_window = 80
+        self.stall_disp_threshold = 0.003
+        self.escape_steps = 10
 
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.logs_dir = Path(logs_dir)
@@ -61,6 +67,7 @@ class ActiveInferenceAgent:
             "action_move_y",
             "action_move_z",
             "action_grip",
+            "escape_active",
             "obs_contact",
             "obs_grip",
             "true_ee_x",
@@ -91,6 +98,7 @@ class ActiveInferenceAgent:
             "action_move_y": float(move[1]),
             "action_move_z": float(move[2]),
             "action_grip": int(action["grip"]),
+            "escape_active": int(self.escape_active),
             "obs_contact": int(observation["o_contact"]),
             "obs_grip": float(observation["o_grip"]),
             "true_ee_x": float(sim_state["ee_pos"][0]),
@@ -104,8 +112,45 @@ class ActiveInferenceAgent:
         if self.step_count % 50 == 0:
             self._csv_file.flush()
 
+    def _maybe_escape_stall(self, action):
+        self.escape_active = 0
+        if self.current_belief is None or self.current_belief.get("phase") != "Reach":
+            self.escape_cooldown = max(0, self.escape_cooldown - 1)
+            return action
+
+        if self.escape_cooldown > 0:
+            self.escape_cooldown -= 1
+            return action
+
+        if len(self.ee_true_history) < self.stall_window + 1:
+            return action
+
+        ee_start = self.ee_true_history[-(self.stall_window + 1)]
+        ee_end = self.ee_true_history[-1]
+        displacement = float(np.linalg.norm(ee_end - ee_start))
+        obj_rel = np.asarray(self.current_belief.get("s_obj_mean", [0.0, 0.0, 0.0]), dtype=float)
+        reach_error = float(np.linalg.norm(obj_rel - REACH_OBJ_REL))
+
+        if displacement >= self.stall_disp_threshold or reach_error < 0.15:
+            return action
+
+        # Escape: brief move away in XY and up in Z, then resume normal policy.
+        xy = obj_rel[:2]
+        xy_norm = float(np.linalg.norm(xy))
+        if xy_norm > 1e-6:
+            xy_away = -xy / xy_norm
+        else:
+            xy_away = np.array([-1.0, 0.0], dtype=float)
+
+        escape_move = np.array([0.004 * xy_away[0], 0.004 * xy_away[1], 0.009], dtype=float)
+        self.escape_cooldown = self.escape_steps
+        self.escape_active = 1
+        print(f"[Escape] stall detected at step {self.step_count}: displacement={displacement:.5f}, reach_error={reach_error:.5f}")
+        return {"move": escape_move.tolist(), "grip": 0}
+
     def step(self):
         sim_state = self.simulator.get_state()
+        self.ee_true_history.append(np.array(sim_state["ee_pos"], dtype=float))
         observation = self.sensors.get_observation(sim_state)
         self.obs_history.append(observation)
 
@@ -115,6 +160,7 @@ class ActiveInferenceAgent:
         )
 
         action = select_action(self.current_belief)
+        action = self._maybe_escape_stall(action)
         self.action_history.append(action)
 
         self._log_step(sim_state, observation, action)
@@ -137,4 +183,3 @@ class ActiveInferenceAgent:
         if hasattr(self, "_csv_file") and self._csv_file and not self._csv_file.closed:
             self._csv_file.flush()
             self._csv_file.close()
-
