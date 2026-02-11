@@ -1,7 +1,6 @@
 import mujoco
 import mujoco.viewer
 import numpy as np
-import time
 
 
 class MujocoSimulator:
@@ -28,6 +27,12 @@ class MujocoSimulator:
         self.ee_site_id = self._get_site_id("ee_center_site")
         self.obj_site_id = self._get_site_id("obj_site")
         self.mocap_id = self._get_mocap_id("panda_mocap")
+        self.obj_body_id = self._get_body_id("obj")
+        self.gripper_body_ids = {
+            self._get_body_id("hand"),
+            self._get_body_id("left_finger"),
+            self._get_body_id("right_finger"),
+        }
 
         self.gripper_joints = [
             self._get_joint_id("finger_joint1"),
@@ -37,6 +42,13 @@ class MujocoSimulator:
             self.model.jnt_qposadr[self.gripper_joints[0]],
             self.model.jnt_qposadr[self.gripper_joints[1]],
         ]
+
+        # Prefer actuator-driven gripper commands when available.
+        aid_r = self._get_actuator_id("r_gripper_finger_joint")
+        aid_l = self._get_actuator_id("l_gripper_finger_joint")
+        self.gripper_actuator_ids = [aid_r, aid_l]
+        self.use_gripper_actuators = (aid_r >= 0 and aid_l >= 0)
+
         # Conservative tracking parameters to avoid dynamic blowups.
         self.mocap_tracking_gain = 0.20
         self.ee_feedback_gain = 0.10
@@ -48,8 +60,6 @@ class MujocoSimulator:
         # Initial settle
         for _ in range(50):
             mujoco.mj_step(self.model, self.data)
-            
-
 
     # ------------------------------------------------
     # Utility ID helpers
@@ -60,12 +70,18 @@ class MujocoSimulator:
     def _get_joint_id(self, name):
         return mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
 
+    def _get_actuator_id(self, name):
+        return mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+
     def _get_mocap_id(self, body_name):
         body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
         mocap_id = int(self.model.body_mocapid[body_id])
         if mocap_id < 0:
             raise ValueError(f"Body '{body_name}' is not a mocap body.")
         return mocap_id
+
+    def _get_body_id(self, name):
+        return mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
 
     # ------------------------------------------------
     # Simulation stepping
@@ -100,7 +116,7 @@ class MujocoSimulator:
         mujoco.mj_forward(self.model, self.data)
 
     # ------------------------------------------------
-    # State access (GROUND TRUTH — internal only)
+    # State access (GROUND TRUTH - internal only)
     # ------------------------------------------------
     def get_state(self):
         """
@@ -111,11 +127,13 @@ class MujocoSimulator:
         ee_pos = self.get_ee_position()
         obj_pos = self.get_object_position()
         gripper_width = self.get_gripper_width()
+        obj_gripper_contact = self.get_object_gripper_contact()
 
         return {
             "ee_pos": ee_pos,
             "obj_pos": obj_pos,
             "gripper_width": gripper_width,
+            "obj_gripper_contact": obj_gripper_contact,
         }
 
     # ------------------------------------------------
@@ -158,6 +176,20 @@ class MujocoSimulator:
     def get_object_position(self):
         return self.data.site_xpos[self.obj_site_id].copy()
 
+    def get_object_gripper_contact(self):
+        """
+        Return 1 if object has physical contact with hand/finger bodies.
+        """
+        for i in range(int(self.data.ncon)):
+            c = self.data.contact[i]
+            b1 = int(self.model.geom_bodyid[c.geom1])
+            b2 = int(self.model.geom_bodyid[c.geom2])
+            if (b1 == self.obj_body_id and b2 in self.gripper_body_ids) or (
+                b2 == self.obj_body_id and b1 in self.gripper_body_ids
+            ):
+                return 1
+        return 0
+
     # ------------------------------------------------
     # Gripper
     # ------------------------------------------------
@@ -167,13 +199,27 @@ class MujocoSimulator:
         return q1 + q2
 
     def open_gripper(self):
-        self._set_gripper_width(0.04)
+        self.set_gripper_width(0.04)
 
     def close_gripper(self):
-        self._set_gripper_width(0.0)
+        self.set_gripper_width(0.0)
+
+    def set_gripper_width(self, width):
+        # width is total gap across both fingers.
+        width = float(np.clip(width, 0.0, 0.08))
+        self._set_gripper_width(width)
 
     def _set_gripper_width(self, width):
         half = width / 2.0
+
+        if self.use_gripper_actuators:
+            # Command both finger actuators to target joint position.
+            for aid in self.gripper_actuator_ids:
+                ctrl_min, ctrl_max = self.model.actuator_ctrlrange[aid]
+                self.data.ctrl[aid] = float(np.clip(half, ctrl_min, ctrl_max))
+            return
+
+        # Fallback for models without named finger actuators.
         self.data.qpos[self.gripper_qpos_addr[0]] = half
         self.data.qpos[self.gripper_qpos_addr[1]] = half
         mujoco.mj_forward(self.model, self.data)

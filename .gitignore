@@ -5,11 +5,11 @@ __pycache__/
 *.pyo
 *.pyc
 *.cpython-*.pyc
+*/*.cpython-*.pyc
 
 # Virtual environments
 .venv/
 venv/
-env/
 
 # Build/test artifacts
 .pytest_cache/

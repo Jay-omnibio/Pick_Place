@@ -17,7 +17,7 @@ def main():
     # ------------------------------------------------
     MODEL_XML_PATH = "assets/pick_and_place.xml"
     SENSOR_CONFIG_PATH = "config/sensor_config.yaml"
-    LOG_EVERY_STEPS = int(os.getenv("LOG_EVERY_STEPS", "20"))
+    LOG_EVERY_STEPS = int(os.getenv("LOG_EVERY_STEPS", "100"))
 
     # ------------------------------------------------
     # Create simulator

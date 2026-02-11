@@ -1,4 +1,5 @@
 import csv
+import os
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,7 @@ class ActiveInferenceAgent:
     sense -> infer -> act
     """
 
-    def __init__(self, simulator, controller, sensor_config_path, log_every_steps=20, logs_dir="logs"):
+    def __init__(self, simulator, controller, sensor_config_path, log_every_steps=100, logs_dir="logs"):
         self.simulator = simulator
         self.controller = controller
         self.log_every_steps = max(1, int(log_every_steps))
@@ -33,15 +34,24 @@ class ActiveInferenceAgent:
 
         self.sensors = SensorSuite(sensor_config)
         self.current_belief = None
+        self.prev_phase = None
+        self.prev_grasp = None
+        self.prev_contact = None
+        self.prev_escape_active = 0
+        self.log_contact_events = os.getenv("LOG_CONTACT_EVENTS", "0") == "1"
 
         self.obs_history = deque(maxlen=50)
         self.action_history = deque(maxlen=50)
         self.ee_true_history = deque(maxlen=120)
         self.escape_cooldown = 0
         self.escape_active = 0
-        self.stall_window = 80
+        self.stall_window = 70
         self.stall_disp_threshold = 0.003
         self.escape_steps = 10
+        self.recovery_steps = 24
+        self.recovery_steps_remaining = 0
+        self.recovery_height = 0.10
+        self.recovery_max_step = 0.010
 
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.logs_dir = Path(logs_dir)
@@ -112,11 +122,31 @@ class ActiveInferenceAgent:
         if self.step_count % 50 == 0:
             self._csv_file.flush()
 
-    def _maybe_escape_stall(self, action):
+    def _build_recovery_action(self, sim_state):
+        """
+        Short true-state guided action used only when stall is detected.
+        This is a local recovery behavior; normal AI policy resumes afterward.
+        """
+        ee_pos = np.array(sim_state["ee_pos"], dtype=float)
+        obj_pos = np.array(sim_state["obj_pos"], dtype=float)
+        desired = obj_pos + np.array([0.0, 0.0, self.recovery_height], dtype=float)
+        vec = desired - ee_pos
+        n = float(np.linalg.norm(vec))
+        if n > self.recovery_max_step and n > 0:
+            vec = (vec / n) * self.recovery_max_step
+        return {"move": vec.tolist(), "grip": 0}
+
+    def _maybe_escape_stall(self, action, sim_state):
         self.escape_active = 0
         if self.current_belief is None or self.current_belief.get("phase") != "Reach":
             self.escape_cooldown = max(0, self.escape_cooldown - 1)
+            self.recovery_steps_remaining = 0
             return action
+
+        if self.recovery_steps_remaining > 0:
+            self.recovery_steps_remaining -= 1
+            self.escape_active = 2
+            return self._build_recovery_action(sim_state)
 
         if self.escape_cooldown > 0:
             self.escape_cooldown -= 1
@@ -134,7 +164,7 @@ class ActiveInferenceAgent:
         if displacement >= self.stall_disp_threshold or reach_error < 0.15:
             return action
 
-        # Escape: brief move away in XY and up in Z, then resume normal policy.
+        # Escape trigger: start a short guided recovery sequence.
         xy = obj_rel[:2]
         xy_norm = float(np.linalg.norm(xy))
         if xy_norm > 1e-6:
@@ -144,6 +174,7 @@ class ActiveInferenceAgent:
 
         escape_move = np.array([0.004 * xy_away[0], 0.004 * xy_away[1], 0.009], dtype=float)
         self.escape_cooldown = self.escape_steps
+        self.recovery_steps_remaining = self.recovery_steps
         self.escape_active = 1
         print(f"[Escape] stall detected at step {self.step_count}: displacement={displacement:.5f}, reach_error={reach_error:.5f}")
         return {"move": escape_move.tolist(), "grip": 0}
@@ -160,10 +191,11 @@ class ActiveInferenceAgent:
         )
 
         action = select_action(self.current_belief)
-        action = self._maybe_escape_stall(action)
+        action = self._maybe_escape_stall(action, sim_state)
         self.action_history.append(action)
 
         self._log_step(sim_state, observation, action)
+        self._log_events(sim_state, observation, action)
 
         if self.step_count % self.log_every_steps == 0:
             obj_rel = np.asarray(self.current_belief["s_obj_mean"], dtype=float)
@@ -183,3 +215,59 @@ class ActiveInferenceAgent:
         if hasattr(self, "_csv_file") and self._csv_file and not self._csv_file.closed:
             self._csv_file.flush()
             self._csv_file.close()
+
+    def _log_events(self, sim_state, observation, action):
+        """
+        Event logs for key state/action transitions so run behavior is easier to inspect.
+        """
+        phase = self.current_belief.get("phase")
+        grasp = int(self.current_belief.get("s_grasp", 0))
+        contact = int(observation.get("o_contact", 0))
+        obj_rel = np.asarray(self.current_belief.get("s_obj_mean", [0.0, 0.0, 0.0]), dtype=float)
+        reach_error = float(np.linalg.norm(obj_rel - REACH_OBJ_REL))
+
+        if self.prev_phase is None:
+            self.prev_phase = phase
+            self.prev_grasp = grasp
+            self.prev_contact = contact
+            self.prev_escape_active = self.escape_active
+            print(f"[Init] phase={phase} grasp={grasp} contact={contact}")
+            return
+
+        if phase != self.prev_phase:
+            print(
+                f"[Phase] step={self.step_count} {self.prev_phase} -> {phase} "
+                f"reach_error={reach_error:.4f} contact={contact} grasp={grasp}"
+            )
+
+        if grasp != self.prev_grasp:
+            if grasp == 1:
+                print(
+                    f"[GraspAcquired] step={self.step_count} "
+                    f"obj_rel={obj_rel.tolist()} grip_width={float(observation.get('o_grip', 0.0)):.4f}"
+                )
+            else:
+                print(
+                    f"[GraspLost] step={self.step_count} "
+                    f"obj_rel={obj_rel.tolist()} grip_width={float(observation.get('o_grip', 0.0)):.4f}"
+                )
+
+        if contact != self.prev_contact and self.log_contact_events:
+            state = "ON" if contact == 1 else "OFF"
+            print(f"[Contact{state}] step={self.step_count} reach_error={reach_error:.4f}")
+
+        if self.escape_active != self.prev_escape_active:
+            label = {
+                0: "OFF",
+                1: "ESCAPE_TRIGGER",
+                2: "RECOVERY_ACTIVE",
+            }.get(self.escape_active, str(self.escape_active))
+            print(
+                f"[Recovery] step={self.step_count} state={label} "
+                f"action_move={action['move']} ee={sim_state['ee_pos'].tolist()}"
+            )
+
+        self.prev_phase = phase
+        self.prev_grasp = grasp
+        self.prev_contact = contact
+        self.prev_escape_active = self.escape_active

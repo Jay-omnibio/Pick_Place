@@ -78,6 +78,9 @@ class SensorSuite:
         Binary contact sensor
         Probabilistic / threshold-based
         """
+        if "obj_gripper_contact" in sim_state:
+            return int(sim_state["obj_gripper_contact"])
+
         dist = np.linalg.norm(sim_state["obj_pos"] - sim_state["ee_pos"])
 
         if dist < self.contact_threshold:
