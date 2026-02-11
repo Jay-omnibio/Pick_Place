@@ -1,0 +1,21 @@
+# ----------------------------------------
+# Sensor configuration for Active Inference
+# ----------------------------------------
+
+ee_sensor:
+  # Proprioceptive EE position sensor
+  # High precision (low noise)
+  noise_std: 0.002        # meters
+
+object_sensor:
+  # Vision-like object-relative sensor
+  # Lower precision (more uncertainty)
+  noise_std: 0.02         # meters
+
+gripper_sensor:
+  # Encoder noise is negligible for now
+  noise_std: 0.0005       # meters
+
+contact_sensor:
+  # Distance threshold under which contact is detected
+  distance_threshold: 0.035   # meters
