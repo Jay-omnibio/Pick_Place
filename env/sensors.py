@@ -16,6 +16,9 @@ class SensorSuite:
     def __init__(self, config):
         self.ee_noise_std = config["ee_sensor"]["noise_std"]
         self.obj_noise_std = config["object_sensor"]["noise_std"]
+        self.target_noise_std = config.get("target_sensor", {}).get(
+            "noise_std", config["object_sensor"]["noise_std"]
+        )
         self.contact_threshold = config["contact_sensor"]["distance_threshold"]
 
     # -------------------------------
@@ -31,12 +34,14 @@ class SensorSuite:
 
         ee_obs = self._sense_ee(sim_state)
         obj_obs = self._sense_object_relative(sim_state)
+        target_obs = self._sense_target_relative(sim_state)
         grip_obs = self._sense_gripper(sim_state)
         contact_obs = self._sense_contact(sim_state)
 
         return {
             "o_ee": ee_obs,
             "o_obj": obj_obs,
+            "o_target": target_obs,
             "o_grip": grip_obs,
             "o_contact": contact_obs,
         }
@@ -64,6 +69,17 @@ class SensorSuite:
 
         relative_pos = true_obj - true_ee
         noise = np.random.normal(0, self.obj_noise_std, size=3)
+        return relative_pos + noise
+
+    def _sense_target_relative(self, sim_state):
+        """
+        Place-target observation (relative to EE).
+        Treated like a vision-style observation (moderate noise).
+        """
+        true_target = sim_state["target_pos"]
+        true_ee = sim_state["ee_pos"]
+        relative_pos = true_target - true_ee
+        noise = np.random.normal(0, self.target_noise_std, size=3)
         return relative_pos + noise
 
     def _sense_gripper(self, sim_state):

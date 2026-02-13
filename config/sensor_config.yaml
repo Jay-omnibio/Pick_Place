@@ -12,6 +12,10 @@ object_sensor:
   # Lower precision (more uncertainty)
   noise_std: 0.02         # meters
 
+target_sensor:
+  # Place-target observation (relative to EE)
+  noise_std: 0.02         # meters
+
 gripper_sensor:
   # Encoder noise is negligible for now
   noise_std: 0.0005       # meters
@@ -19,3 +23,17 @@ gripper_sensor:
 contact_sensor:
   # Distance threshold under which contact is detected
   distance_threshold: 0.035   # meters
+
+# ----------------------------------------
+# Observation filter (Kalman, outlier rejection, latency)
+# ----------------------------------------
+observation_filter:
+  enabled: true
+  kalman_process_std: 0.015
+  kalman_measure_std_obj: 0.03
+  kalman_measure_std_target: 0.03
+  kalman_measure_std_ee: 0.005
+  outlier_max_jump_obj: 0.15
+  outlier_max_jump_target: 0.15
+  outlier_max_jump_ee: 0.08
+  latency_steps: 0        # 0 = no delay (use 2-5 for real camera)

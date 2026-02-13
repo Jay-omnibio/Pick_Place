@@ -1,0 +1,7 @@
+# ----------------------------------------
+# Safety layer (workspace, velocity, timeouts)
+# ----------------------------------------
+workspace_min: [0.05, -0.50, 0.005]
+workspace_max: [0.85, 0.50, 0.95]
+max_move_norm: 0.05
+max_ee_target_radius: 0.85

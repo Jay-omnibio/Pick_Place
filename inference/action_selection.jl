@@ -6,15 +6,16 @@ using Distributions
 # ------------------------------------------------
 
 const LAMBDA_EPISTEMIC = 0.1   # curiosity weight
-const DELTA = 0.018            # step size for EE movement
-const REACH_OBJ_REL = [0.0, 0.0, -0.08]
+const DELTA = 0.022            # step size for EE movement
+const REACH_DELTA = 0.026
+const REACH_OBJ_REL = [0.0, 0.0, -0.10]
 const ACTION_EFFECTIVENESS = 0.4
-const XY_ALIGN_THRESHOLD = 0.04
-const XY_BLEND_FLOOR = 0.25
-const GRASP_STEP = 0.008
-const ALIGN_STEP = 0.010
-const GRASP_SIDE_OFFSET_Y = 0.020
-const ALIGN_REL_Z = -0.09
+const XY_ALIGN_THRESHOLD = 0.07
+const XY_BLEND_FLOOR = 0.0
+const GRASP_STEP = 0.010
+const ALIGN_STEP = 0.012
+const GRASP_SIDE_OFFSET_Y = 0.000
+const ALIGN_REL_Z = -0.10
 
 # ------------------------------------------------
 # Action definitions
@@ -157,34 +158,36 @@ function select_action(current_belief)
         z_weight = min(1.0, max(XY_BLEND_FLOOR, 1.0 - (xy_err_norm / XY_ALIGN_THRESHOLD)))
         desired_move = [err[1], err[2], z_weight * err[3]]
         n = norm(desired_move)
-        if n > DELTA && n > 0.0
-            desired_move = (desired_move / n) * DELTA
+        if n > REACH_DELTA && n > 0.0
+            desired_move = (desired_move / n) * REACH_DELTA
         end
         return (move = desired_move, grip = -1)
     elseif phase == :Align
         s_obj = current_belief[:s_obj_mean]
-        side_sign = get(current_belief, :grasp_side_sign, s_obj[2] >= 0.0 ? -1.0 : 1.0)
-        align_rel = [0.0, side_sign * GRASP_SIDE_OFFSET_Y, ALIGN_REL_Z]
+        align_rel = [0.0, 0.0, ALIGN_REL_Z]
         err = s_obj - align_rel
-        desired = [0.7 * err[1], 1.0 * err[2], 0.8 * err[3]]
+        desired = [0.9 * err[1], 0.9 * err[2], 0.9 * err[3]]
         n = norm(desired)
         if n > ALIGN_STEP && n > 0.0
             desired = (desired / n) * ALIGN_STEP
         end
         return (move = desired, grip = -1)
-    elseif phase == :Grasp
-        if get(current_belief, :s_grasp, 0) == 0
-            s_obj = current_belief[:s_obj_mean]
-            grasp_rel = [0.0, 0.0, -0.08]
-            err = s_obj - grasp_rel
-            desired = [0.9 * err[1], 0.9 * err[2], 0.9 * err[3]]
-            n = norm(desired)
-            if n > GRASP_STEP && n > 0.0
-                desired = (desired / n) * GRASP_STEP
-            end
-            return (move = desired, grip = 1)
+    elseif phase == :PreGraspHold
+        return (move = [0.0, 0.0, 0.0], grip = -1)
+    elseif phase == :Descend
+        s_obj = current_belief[:s_obj_mean]
+        descend_rel = [0.0, 0.0, -0.10]
+        err = s_obj - descend_rel
+        desired = [0.12 * err[1], 0.12 * err[2], 1.0 * err[3]]
+        n = norm(desired)
+        if n > GRASP_STEP && n > 0.0
+            desired = (desired / n) * GRASP_STEP
         end
+        return (move = desired, grip = -1)
+    elseif phase == :CloseHold || phase == :Grasp
         return (move = [0.0, 0.0, 0.0], grip = 1)
+    elseif phase == :LiftTest
+        return (move = [0.0, 0.0, DELTA], grip = 1)
     elseif phase == :Lift
         return (move = [0.0, 0.0, DELTA], grip = 1)
     end

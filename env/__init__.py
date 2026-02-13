@@ -2,7 +2,12 @@
 Environment module: Simulation and sensor interfaces.
 """
 
-from .simulator import MujocoSimulator
 from .sensors import SensorSuite
 
-__all__ = ["MujocoSimulator", "SensorSuite"]
+try:
+    # Importing MuJoCo can fail in minimal environments (CI, linting, docs builds).
+    from .simulator import MujocoSimulator  # type: ignore
+
+    __all__ = ["MujocoSimulator", "SensorSuite"]
+except Exception:
+    __all__ = ["SensorSuite"]

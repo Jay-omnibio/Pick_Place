@@ -26,8 +26,10 @@ class MujocoSimulator:
         # Cache IDs
         self.ee_site_id = self._get_site_id("ee_center_site")
         self.obj_site_id = self._get_site_id("obj_site")
+        self.target_site_id = self._get_site_id("target")
         self.mocap_id = self._get_mocap_id("panda_mocap")
         self.obj_body_id = self._get_body_id("obj")
+        self.hand_body_id = self._get_body_id("hand")
         self.gripper_body_ids = {
             self._get_body_id("hand"),
             self._get_body_id("left_finger"),
@@ -38,9 +40,15 @@ class MujocoSimulator:
             self._get_joint_id("finger_joint1"),
             self._get_joint_id("finger_joint2"),
         ]
+        self.joint7_id = self._get_joint_id("joint7")
+        self.joint7_qpos_addr = self.model.jnt_qposadr[self.joint7_id]
         self.gripper_qpos_addr = [
             self.model.jnt_qposadr[self.gripper_joints[0]],
             self.model.jnt_qposadr[self.gripper_joints[1]],
+        ]
+        self.gripper_dof_addr = [
+            self.model.jnt_dofadr[self.gripper_joints[0]],
+            self.model.jnt_dofadr[self.gripper_joints[1]],
         ]
 
         # Prefer actuator-driven gripper commands when available.
@@ -54,7 +62,8 @@ class MujocoSimulator:
         self.ee_feedback_gain = 0.10
         self.max_mocap_step = 0.008
         self.max_ee_feedback_err = 0.12
-        self.workspace_min = np.array([0.05, -0.50, 0.08], dtype=float)
+        # Keep Z floor low enough so Descend can reach near-object grasp height.
+        self.workspace_min = np.array([0.05, -0.50, 0.005], dtype=float)
         self.workspace_max = np.array([0.85, 0.50, 0.95], dtype=float)
 
         # Initial settle
@@ -126,14 +135,19 @@ class MujocoSimulator:
 
         ee_pos = self.get_ee_position()
         obj_pos = self.get_object_position()
+        target_pos = self.get_target_position()
         gripper_width = self.get_gripper_width()
         obj_gripper_contact = self.get_object_gripper_contact()
 
         return {
             "ee_pos": ee_pos,
             "obj_pos": obj_pos,
+            "target_pos": target_pos,
             "gripper_width": gripper_width,
+            "gripper_speed": self.get_gripper_speed(),
             "obj_gripper_contact": obj_gripper_contact,
+            "joint7_pos": self.get_joint7_position(),
+            "hand_quat_wxyz": self.get_hand_orientation_quat(),
         }
 
     # ------------------------------------------------
@@ -144,6 +158,13 @@ class MujocoSimulator:
 
     def get_mocap_position(self):
         return self.data.mocap_pos[self.mocap_id].copy()
+
+    def get_hand_orientation_quat(self):
+        # World orientation of hand body as quaternion [w, x, y, z].
+        return self.data.xquat[self.hand_body_id].copy()
+
+    def get_joint7_position(self):
+        return float(self.data.qpos[self.joint7_qpos_addr])
 
     def set_ee_position(self, target_pos):
         """
@@ -176,6 +197,12 @@ class MujocoSimulator:
     def get_object_position(self):
         return self.data.site_xpos[self.obj_site_id].copy()
 
+    # ------------------------------------------------
+    # Target (place site)
+    # ------------------------------------------------
+    def get_target_position(self):
+        return self.data.site_xpos[self.target_site_id].copy()
+
     def get_object_gripper_contact(self):
         """
         Return 1 if object has physical contact with hand/finger bodies.
@@ -197,6 +224,11 @@ class MujocoSimulator:
         q1 = self.data.qpos[self.gripper_qpos_addr[0]]
         q2 = self.data.qpos[self.gripper_qpos_addr[1]]
         return q1 + q2
+
+    def get_gripper_speed(self):
+        v1 = self.data.qvel[self.gripper_dof_addr[0]]
+        v2 = self.data.qvel[self.gripper_dof_addr[1]]
+        return v1 + v2
 
     def open_gripper(self):
         self.set_gripper_width(0.04)

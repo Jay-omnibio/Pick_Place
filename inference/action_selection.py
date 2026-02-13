@@ -144,14 +144,15 @@ def _select_action_python(current_belief):
     
     # Configuration
     LAMBDA_EPISTEMIC = 0.1
-    DELTA = 0.018
-    REACH_OBJ_REL = np.array([0.0, 0.0, -0.08])
-    XY_ALIGN_THRESHOLD = 0.04
-    XY_BLEND_FLOOR = 0.25
-    GRASP_STEP = 0.008
-    ALIGN_STEP = 0.010
-    GRASP_SIDE_OFFSET_Y = 0.020
-    ALIGN_REL_Z = -0.09
+    DELTA = 0.022
+    REACH_DELTA = 0.026
+    REACH_OBJ_REL = np.array([0.0, 0.0, -0.10])
+    XY_ALIGN_THRESHOLD = 0.07
+    XY_BLEND_FLOOR = 0.0
+    GRASP_STEP = 0.010
+    ALIGN_STEP = 0.012
+    GRASP_SIDE_OFFSET_Y = 0.000
+    ALIGN_REL_Z = -0.10
 
     # Generate candidate actions
     moves = [
@@ -183,34 +184,55 @@ def _select_action_python(current_belief):
         # Adaptive blend:
         # - large XY error => mostly XY correction
         # - small XY error => allow stronger Z correction
-        # Keeps some Z authority in all cases to avoid hard-mode switching stalls.
+        # Real-robot style: keep near-planar approach first, descend later.
         z_weight = min(1.0, max(XY_BLEND_FLOOR, 1.0 - (xy_err_norm / XY_ALIGN_THRESHOLD)))
         desired_move = np.array([err[0], err[1], z_weight * err[2]], dtype=float)
 
         norm = np.linalg.norm(desired_move)
-        if norm > DELTA and norm > 0:
-            desired_move = (desired_move / norm) * DELTA
+        if norm > REACH_DELTA and norm > 0:
+            desired_move = (desired_move / norm) * REACH_DELTA
         return {"move": desired_move.tolist(), "grip": -1}
 
     if phase == "Align":
         s_obj = np.array(current_belief.get("s_obj_mean", [0, 0, 0]), dtype=float)
-        side_sign = float(current_belief.get("grasp_side_sign", -1.0 if s_obj[1] >= 0.0 else 1.0))
-        align_rel = np.array([0.0, side_sign * GRASP_SIDE_OFFSET_Y, ALIGN_REL_Z], dtype=float)
+        align_rel = np.array([0.0, 0.0, ALIGN_REL_Z], dtype=float)
         err = s_obj - align_rel
-        desired = np.array([0.7 * err[0], 1.0 * err[1], 0.8 * err[2]], dtype=float)
+        desired = np.array([0.9 * err[0], 0.9 * err[1], 0.9 * err[2]], dtype=float)
         n = np.linalg.norm(desired)
         if n > ALIGN_STEP and n > 0:
             desired = (desired / n) * ALIGN_STEP
         # Keep gripper open while aligning.
         return {"move": desired.tolist(), "grip": -1}
 
-    if phase == "Grasp" or phase == 2:
-        # In grasp, center object between fingers and close.
+    if phase == "PreGraspHold":
+        # Hold above object to settle posture before final descend.
+        return {"move": [0.0, 0.0, 0.0], "grip": -1}
+
+    if phase == "Descend":
+        s_obj = np.array(current_belief.get("s_obj_mean", [0, 0, 0]), dtype=float)
+        descend_rel = np.array([0.0, 0.0, -0.10], dtype=float)
+        err = s_obj - descend_rel
+        desired = np.array([0.12 * err[0], 0.12 * err[1], 1.0 * err[2]], dtype=float)
+        n = np.linalg.norm(desired)
+        if n > GRASP_STEP and n > 0:
+            desired = (desired / n) * GRASP_STEP
+        return {"move": desired.tolist(), "grip": -1}
+
+    if phase == "CloseHold" or phase == "Grasp" or phase == 2:
+        # Close in place: no Cartesian motion while fingers settle/contact.
+        return {"move": [0.0, 0.0, 0.0], "grip": 1}
+
+    if phase == "LiftTest":
+        return {"move": [0.0, 0.0, DELTA], "grip": 1}
+
+    if phase == "LegacyGrasp":
+        # legacy fallback kept for compatibility
         if int(current_belief.get("s_grasp", 0)) == 0:
             s_obj = np.array(current_belief.get("s_obj_mean", [0, 0, 0]), dtype=float)
-            grasp_rel = np.array([0.0, 0.0, -0.08], dtype=float)
+            grasp_rel = np.array([0.0, 0.0, -0.10], dtype=float)
             err = s_obj - grasp_rel
-            desired = np.array([0.9 * err[0], 0.9 * err[1], 0.9 * err[2]], dtype=float)
+            # Final descend from above: prioritize Z, keep XY drift very small.
+            desired = np.array([0.15 * err[0], 0.15 * err[1], 1.0 * err[2]], dtype=float)
             n = np.linalg.norm(desired)
             if n > GRASP_STEP and n > 0:
                 desired = (desired / n) * GRASP_STEP

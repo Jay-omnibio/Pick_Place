@@ -1,44 +1,39 @@
-import time
 import os
+import time
+import yaml
 
-# Simulator
 from env.simulator import MujocoSimulator
-
-# Controller
 from control.controller import EEController
-
-# Agent
 from agent.agent_loop import ActiveInferenceAgent
+from backends.sensor_backend import SimSensorBackend
+from backends.actuator_backend import SimActuatorBackend
+from safety.safety_checker import SafetyChecker
 
 
 def main():
-    # ------------------------------------------------
-    # Paths
-    # ------------------------------------------------
     MODEL_XML_PATH = "assets/pick_and_place.xml"
     SENSOR_CONFIG_PATH = "config/sensor_config.yaml"
+    SAFETY_CONFIG_PATH = "config/safety_config.yaml"
     LOG_EVERY_STEPS = int(os.getenv("LOG_EVERY_STEPS", "100"))
+    CONTROL_MODE = os.getenv("CONTROL_MODE", "fsm").strip().lower()
 
-    # ------------------------------------------------
-    # Create simulator
-    # ------------------------------------------------
-    simulator = MujocoSimulator(
-        model_path=MODEL_XML_PATH,
-        render=True
-    )
-
-    # ------------------------------------------------
-    # Create controller
-    # ------------------------------------------------
+    simulator = MujocoSimulator(model_path=MODEL_XML_PATH, render=True)
     controller = EEController(simulator)
 
-    # ------------------------------------------------
-    # Create Active Inference agent
-    # ------------------------------------------------
+    with open(SENSOR_CONFIG_PATH, "r") as f:
+        sensor_config = yaml.safe_load(f)
+    with open(SAFETY_CONFIG_PATH, "r") as f:
+        safety_config = yaml.safe_load(f)
+
+    sensor_backend = SimSensorBackend(config_path=SENSOR_CONFIG_PATH, config=sensor_config)
+    safety_checker = SafetyChecker(safety_config)
+    actuator_backend = SimActuatorBackend(controller, safety_checker)
+
     agent = ActiveInferenceAgent(
         simulator=simulator,
-        controller=controller,
-        sensor_config_path=SENSOR_CONFIG_PATH,
+        sensor_backend=sensor_backend,
+        actuator_backend=actuator_backend,
+        control_mode=CONTROL_MODE,
         log_every_steps=LOG_EVERY_STEPS,
     )
 
@@ -47,6 +42,7 @@ def main():
     # ------------------------------------------------
     print("Starting Active Inference Pick-and-Place demo...")
     print("Press Ctrl+C to stop.")
+    print(f"Control mode: {CONTROL_MODE}")
     print(f"Console log frequency: every {LOG_EVERY_STEPS} steps")
 
     try:
