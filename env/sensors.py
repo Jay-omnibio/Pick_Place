@@ -16,6 +16,7 @@ class SensorSuite:
     def __init__(self, config):
         self.ee_noise_std = config["ee_sensor"]["noise_std"]
         self.obj_noise_std = config["object_sensor"]["noise_std"]
+        self.obj_yaw_noise_std = config["object_sensor"].get("yaw_noise_std", 0.0)
         self.target_noise_std = config.get("target_sensor", {}).get(
             "noise_std", config["object_sensor"]["noise_std"]
         )
@@ -35,6 +36,7 @@ class SensorSuite:
         ee_obs = self._sense_ee(sim_state)
         obj_obs = self._sense_object_relative(sim_state)
         target_obs = self._sense_target_relative(sim_state)
+        obj_yaw_obs = self._sense_object_yaw(sim_state)
         grip_obs = self._sense_gripper(sim_state)
         contact_obs = self._sense_contact(sim_state)
 
@@ -42,6 +44,7 @@ class SensorSuite:
             "o_ee": ee_obs,
             "o_obj": obj_obs,
             "o_target": target_obs,
+            "o_obj_yaw": obj_yaw_obs,
             "o_grip": grip_obs,
             "o_contact": contact_obs,
         }
@@ -81,6 +84,23 @@ class SensorSuite:
         relative_pos = true_target - true_ee
         noise = np.random.normal(0, self.target_noise_std, size=3)
         return relative_pos + noise
+
+    @staticmethod
+    def _quat_wxyz_to_yaw(quat_wxyz):
+        w, x, y, z = [float(v) for v in quat_wxyz]
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return float(np.arctan2(siny_cosp, cosy_cosp))
+
+    def _sense_object_yaw(self, sim_state):
+        """
+        Object yaw around world Z (radians), from true object quaternion.
+        """
+        quat = sim_state.get("obj_quat_wxyz", [1.0, 0.0, 0.0, 0.0])
+        yaw = self._quat_wxyz_to_yaw(quat)
+        if self.obj_yaw_noise_std > 0.0:
+            yaw += float(np.random.normal(0.0, self.obj_yaw_noise_std))
+        return float(yaw)
 
     def _sense_gripper(self, sim_state):
         """

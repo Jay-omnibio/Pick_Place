@@ -142,6 +142,7 @@ class MujocoSimulator:
         return {
             "ee_pos": ee_pos,
             "obj_pos": obj_pos,
+            "obj_quat_wxyz": self.get_object_orientation_quat(),
             "target_pos": target_pos,
             "gripper_width": gripper_width,
             "gripper_speed": self.get_gripper_speed(),
@@ -196,6 +197,10 @@ class MujocoSimulator:
     # ------------------------------------------------
     def get_object_position(self):
         return self.data.site_xpos[self.obj_site_id].copy()
+
+    def get_object_orientation_quat(self):
+        # World orientation of object body as quaternion [w, x, y, z].
+        return self.data.xquat[self.obj_body_id].copy()
 
     # ------------------------------------------------
     # Target (place site)

@@ -1,6 +1,5 @@
 import numpy as np
 import mujoco
-import os
 
 
 class EEController:
@@ -14,21 +13,57 @@ class EEController:
     - bias joints toward a preferred posture to avoid stretched / awkward arm shapes
     """
 
-    def __init__(self, simulator, config=None):
+    REQUIRED_CONFIG_KEYS = {
+        "max_step",
+        "min_height",
+        "max_target_radius",
+        "ik_damping",
+        "nullspace_gain",
+        "nullspace_gain_grasp",
+        "max_joint_step",
+        "ee_tolerance",
+        "move_smoothing",
+        "yaw_target",
+        "yaw_weight",
+        "yaw_weight_grasp",
+        "enable_yaw_objective",
+        "yaw_axis",
+        "enable_topdown_objective",
+        "topdown_weight",
+        "topdown_weight_grasp",
+        "tool_axis",
+        "gripper_open_width",
+        "gripper_close_width",
+        "gripper_rate",
+        "gripper_width_tol",
+        "gripper_speed_tol",
+        "gripper_switch_cooldown_steps",
+        "debug_every_steps",
+    }
+
+    def __init__(self, simulator, config):
         self.simulator = simulator
+        if not isinstance(config, dict):
+            raise ValueError("EEController requires a config dict loaded from config/tuning_config.yaml.")
+        missing = sorted(self.REQUIRED_CONFIG_KEYS - set(config.keys()))
+        if missing:
+            raise ValueError(f"EEController config missing required keys: {missing}")
+        extra = sorted(set(config.keys()) - self.REQUIRED_CONFIG_KEYS)
+        if extra:
+            raise ValueError(f"EEController config has unknown keys: {extra}")
 
         # Action-space and safety limits
-        self.max_step = 0.03  #0.015 max EE movement per control step, to avoid large jumps that may cause instability
-        self.min_height = 0.02
-        self.max_target_radius = 0.78
+        self.max_step = float(config["max_step"])
+        self.min_height = float(config["min_height"])
+        self.max_target_radius = float(config["max_target_radius"])
 
         # IK / posture parameters
-        self.ik_damping = 0.03
-        self.nullspace_gain = 0.15
-        self.nullspace_gain_grasp = 0.05
-        self.max_joint_step = 0.20 #0.10 per control step, to avoid large jumps that may cause instability
-        self.ee_tolerance = 1e-4
-        self.move_smoothing = 0.55
+        self.ik_damping = float(config["ik_damping"])
+        self.nullspace_gain = float(config["nullspace_gain"])
+        self.nullspace_gain_grasp = float(config["nullspace_gain_grasp"])
+        self.max_joint_step = float(config["max_joint_step"])
+        self.ee_tolerance = float(config["ee_tolerance"])
+        self.move_smoothing = float(config["move_smoothing"])
 
         # Orientation objective (yaw alignment in world XY plane)
         # IMPORTANT:
@@ -36,69 +71,34 @@ class EEController:
         #     0:+X, 1:+Y, 2:-X, 3:-Y
         # - Otherwise it is treated as a yaw angle in radians.
         # This avoids the previous bug where "3" was interpreted as 3 radians (~171°).
-        self.yaw_target = 3
-        self.yaw_weight = 0.25 # orientation objective weight during approach
-        self.yaw_weight_grasp = 1.0 # orientation objective weight during grasp (when grip_cmd=1), set higher to prioritize correct gripper orientation for grasping
-        self.enable_yaw_objective = (os.getenv("CTRL_ENABLE_YAW", "1") == "1")
-        self.yaw_axis = 1 # gripper Y axis should align with world Y for best grasping, but can be set to 0 (X) or 2 (Z) for different approach orientations
-        self.enable_topdown_objective = (os.getenv("CTRL_ENABLE_TOPDOWN", "1") == "1")
-        self.topdown_weight = 0.60   # stronger during approach so gripper stays vertical
-        self.topdown_weight_grasp = 1.20  # even stronger during descend/close to avoid flat orientation
-        self.tool_axis = 2 #
+        self.yaw_target = config["yaw_target"]
+        self.yaw_weight = float(config["yaw_weight"])
+        self.yaw_weight_grasp = float(config["yaw_weight_grasp"])
+        self.enable_yaw_objective = bool(config["enable_yaw_objective"])
+        self.yaw_axis = int(config["yaw_axis"])
+        self.enable_topdown_objective = bool(config["enable_topdown_objective"])
+        self.topdown_weight = float(config["topdown_weight"])
+        self.topdown_weight_grasp = float(config["topdown_weight_grasp"])
+        self.tool_axis = int(config["tool_axis"])
 
         # Gripper dynamics
-        self.gripper_open_width = 0.060
-        self.gripper_close_width = 0.0
-        self.gripper_rate = 0.03 # how much the gripper width can change per control step, to avoid instability changed form 0.03
-        self.gripper_target_width = None
+        self.gripper_open_width = float(config["gripper_open_width"])
+        self.gripper_close_width = float(config["gripper_close_width"])
+        self.gripper_rate = float(config["gripper_rate"])
+        self.gripper_target_width = None 
         self.gripper_mode = "open"
         self.gripper_state = "READY"
-        self.gripper_width_tol = 0.0015
-        self.gripper_speed_tol = 0.002
-        self.gripper_switch_cooldown_steps = 6
-        self.gripper_switch_cooldown = 0
-        self.debug_every_steps = int(os.getenv("CTRL_DEBUG_EVERY_STEPS", "100"))
+        self.gripper_width_tol = float(config["gripper_width_tol"])
+        self.gripper_speed_tol = float(config["gripper_speed_tol"])
+        self.gripper_switch_cooldown_steps = int(config["gripper_switch_cooldown_steps"])
+        self.gripper_switch_cooldown = 0 
+        self.debug_every_steps = int(config["debug_every_steps"])
         self.control_step = 0
         self.last_requested_move_norm = 0.0
         self.last_applied_move_norm = 0.0
         self.last_dq_norm_raw = 0.0
         self.last_dq_norm_applied = 0.0
         self.prev_move_delta = np.zeros(3, dtype=float)
-
-        if config is not None:
-            self.max_step = config.get("max_step", self.max_step)
-            self.min_height = config.get("min_height", self.min_height)
-            self.max_target_radius = config.get("max_target_radius", self.max_target_radius)
-            self.ik_damping = config.get("ik_damping", self.ik_damping)
-            self.nullspace_gain = config.get("nullspace_gain", self.nullspace_gain)
-            self.nullspace_gain_grasp = config.get("nullspace_gain_grasp", self.nullspace_gain_grasp)
-            self.max_joint_step = config.get("max_joint_step", self.max_joint_step)
-            self.ee_tolerance = config.get("ee_tolerance", self.ee_tolerance)
-            self.move_smoothing = config.get("move_smoothing", self.move_smoothing)
-            self.yaw_target = config.get("yaw_target", self.yaw_target)
-            self.yaw_weight = config.get("yaw_weight", self.yaw_weight)
-            self.yaw_weight_grasp = config.get("yaw_weight_grasp", self.yaw_weight_grasp)
-            self.enable_yaw_objective = config.get("enable_yaw_objective", self.enable_yaw_objective)
-            self.yaw_axis = int(config.get("yaw_axis", self.yaw_axis))
-            self.enable_topdown_objective = config.get("enable_topdown_objective", self.enable_topdown_objective)
-            self.topdown_weight = config.get("topdown_weight", self.topdown_weight)
-            self.topdown_weight_grasp = config.get("topdown_weight_grasp", self.topdown_weight_grasp)
-            self.tool_axis = int(config.get("tool_axis", self.tool_axis))
-            self.gripper_open_width = config.get("gripper_open_width", self.gripper_open_width)
-            self.gripper_close_width = config.get("gripper_close_width", self.gripper_close_width)
-            self.gripper_rate = config.get("gripper_rate", self.gripper_rate)
-            self.gripper_width_tol = config.get("gripper_width_tol", self.gripper_width_tol)
-            self.gripper_speed_tol = config.get("gripper_speed_tol", self.gripper_speed_tol)
-            self.gripper_switch_cooldown_steps = config.get(
-                "gripper_switch_cooldown_steps", self.gripper_switch_cooldown_steps
-            )
-            self.debug_every_steps = int(config.get("debug_every_steps", self.debug_every_steps))
-
-        # Environment variables override config (useful for quick experiments).
-        if os.getenv("CTRL_ENABLE_YAW") is not None:
-            self.enable_yaw_objective = (os.getenv("CTRL_ENABLE_YAW", "1") == "1")
-        if os.getenv("CTRL_ENABLE_TOPDOWN") is not None:
-            self.enable_topdown_objective = (os.getenv("CTRL_ENABLE_TOPDOWN", "1") == "1")
 
         self.yaw_target = self._interpret_yaw_target(self.yaw_target)
 
@@ -179,6 +179,8 @@ class EEController:
             "grip": 0|1|-1,
             optional: "max_step_scale": float (0..1 for guarded motion),
             optional: "enable_yaw_objective": bool,
+            optional: "yaw_target": float (radians) or cardinal int {0,1,2,3},
+            optional: "yaw_pi_symmetric": bool (treat yaw and yaw+pi as equivalent; pick shorter turn),
             optional: "enable_topdown_objective": bool,
         }
         If ee_target_pos is given, move is computed as (ee_target_pos - current_ee), clamped by max_step * max_step_scale.
@@ -189,6 +191,8 @@ class EEController:
         grip_cmd = int(action.get("grip", 0))
         # Per-step orientation (do not overwrite instance defaults).
         self._step_enable_yaw = action.get("enable_yaw_objective", self.enable_yaw_objective)
+        self._step_yaw_target = self._interpret_yaw_target(action.get("yaw_target", self.yaw_target))
+        self._step_yaw_pi_symmetric = bool(action.get("yaw_pi_symmetric", False))
         self._step_enable_topdown = action.get("enable_topdown_objective", self.enable_topdown_objective)
 
         if "ee_target_pos" in action:
@@ -278,7 +282,12 @@ class EEController:
 
         if getattr(self, "_step_enable_yaw", self.enable_yaw_objective):
             ee_yaw = self._get_ee_yaw()
-            yaw_err = self._wrap_to_pi(self.yaw_target - ee_yaw)
+            yaw_target = float(getattr(self, "_step_yaw_target", self.yaw_target))
+            yaw_err = self._compute_yaw_error(
+                current_yaw=ee_yaw,
+                desired_yaw=yaw_target,
+                pi_symmetric=bool(getattr(self, "_step_yaw_pi_symmetric", False)),
+            )
             yaw_w = self.yaw_weight_grasp if grip_cmd == 1 else self.yaw_weight
             if yaw_w > 0.0:
                 J_yaw = jacr[2, self.arm_dof_addr].reshape(1, -1)
@@ -385,6 +394,20 @@ class EEController:
 
     def _get_ee_xmat(self):
         return np.array(self.simulator.data.site_xmat[self.simulator.ee_site_id], dtype=float).reshape(3, 3)
+
+    @classmethod
+    def _compute_yaw_error(cls, current_yaw, desired_yaw, pi_symmetric=False):
+        """
+        Compute shortest signed yaw error.
+        If pi_symmetric=True, treat yaw and yaw+pi as equivalent and choose
+        the smallest-magnitude error among equivalent targets.
+        """
+        e0 = cls._wrap_to_pi(float(desired_yaw) - float(current_yaw))
+        if not pi_symmetric:
+            return e0
+        e1 = cls._wrap_to_pi(float(desired_yaw + np.pi) - float(current_yaw))
+        e2 = cls._wrap_to_pi(float(desired_yaw - np.pi) - float(current_yaw))
+        return min((e0, e1, e2), key=lambda x: abs(float(x)))
 
     @staticmethod
     def _wrap_to_pi(angle):

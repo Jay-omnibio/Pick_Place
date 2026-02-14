@@ -8,17 +8,21 @@ from agent.agent_loop import ActiveInferenceAgent
 from backends.sensor_backend import SimSensorBackend
 from backends.actuator_backend import SimActuatorBackend
 from safety.safety_checker import SafetyChecker
+from config.tuning_loader import load_tuning_sections
 
 
 def main():
     MODEL_XML_PATH = "assets/pick_and_place.xml"
     SENSOR_CONFIG_PATH = "config/sensor_config.yaml"
     SAFETY_CONFIG_PATH = "config/safety_config.yaml"
-    LOG_EVERY_STEPS = int(os.getenv("LOG_EVERY_STEPS", "100"))
-    CONTROL_MODE = os.getenv("CONTROL_MODE", "fsm").strip().lower()
+    TUNING_CONFIG_PATH = os.getenv("TUNING_CONFIG_PATH", "config/tuning_config.yaml")
+    tuning = load_tuning_sections(TUNING_CONFIG_PATH)
+    run_cfg = tuning["run_cfg"]
+    LOG_EVERY_STEPS = int(run_cfg["log_every_steps"])
+    CONTROL_MODE = str(run_cfg["control_mode"]).strip().lower()
 
     simulator = MujocoSimulator(model_path=MODEL_XML_PATH, render=True)
-    controller = EEController(simulator)
+    controller = EEController(simulator, config=tuning["controller_cfg"])
 
     with open(SENSOR_CONFIG_PATH, "r") as f:
         sensor_config = yaml.safe_load(f)
@@ -35,6 +39,8 @@ def main():
         actuator_backend=actuator_backend,
         control_mode=CONTROL_MODE,
         log_every_steps=LOG_EVERY_STEPS,
+        task_cfg=tuning["task_cfg"],
+        policy_cfg=tuning["policy_cfg"],
     )
 
     # ------------------------------------------------
@@ -44,6 +50,10 @@ def main():
     print("Press Ctrl+C to stop.")
     print(f"Control mode: {CONTROL_MODE}")
     print(f"Console log frequency: every {LOG_EVERY_STEPS} steps")
+    print(
+        f"Tuning config: {tuning['path']} "
+        f"(found={int(tuning['found'])}, strict={int(tuning.get('strict', False))})"
+    )
 
     try:
         while True:

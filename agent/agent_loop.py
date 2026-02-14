@@ -36,6 +36,8 @@ class ActiveInferenceAgent:
         control_mode="fsm",
         log_every_steps=100,
         logs_dir="logs",
+        task_cfg=None,
+        policy_cfg=None,
     ):
         self.simulator = simulator
         self.sensor_backend = sensor_backend
@@ -45,9 +47,13 @@ class ActiveInferenceAgent:
             raise ValueError(f"Unsupported control_mode: {control_mode}")
         self.log_every_steps = max(1, int(log_every_steps))
         self.step_count = 0
-        self.task_cfg = TaskConfig()
+        if task_cfg is None:
+            raise ValueError("task_cfg is required. Load it from config/tuning_config.yaml.")
+        if policy_cfg is None:
+            raise ValueError("policy_cfg is required. Load it from config/tuning_config.yaml.")
+        self.task_cfg = task_cfg
         self.task_state = None
-        self.policy = ScriptedPickPlacePolicy(task_cfg=self.task_cfg)
+        self.policy = ScriptedPickPlacePolicy(task_cfg=self.task_cfg, policy_cfg=policy_cfg)
         self.current_belief = None
         self.prev_phase = None
         self.prev_contact = None
@@ -147,6 +153,186 @@ class ActiveInferenceAgent:
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
         return roll, pitch, yaw
+
+    def _phase_name(self):
+        if self.control_mode == "active_inference":
+            if self.current_belief is None:
+                return "Reach"
+            return str(self.current_belief.get("phase", "Reach"))
+        return self.task_state.phase.value if self.task_state is not None else Phase.ReachAbove.value
+
+    def _get_references(self):
+        if self.control_mode == "active_inference":
+            reach_ref = np.array([0.0, 0.0, -0.08], dtype=float)
+            return reach_ref, reach_ref
+        return self.task_cfg.pregrasp_obj_rel, self.task_cfg.grasp_obj_rel
+
+    def _collect_log_metrics(self, sim_state, observation):
+        reach_ref, descend_ref = self._get_references()
+        obj_rel = np.asarray(observation.get("o_obj", [0.0, 0.0, 0.0]), dtype=float)
+        target_rel = np.asarray(observation.get("o_target", [0.0, 0.0, 0.0]), dtype=float)
+        ee_pos = np.asarray(sim_state.get("ee_pos", [0.0, 0.0, 0.0]), dtype=float)
+        obj_pos = np.asarray(sim_state.get("obj_pos", [0.0, 0.0, 0.0]), dtype=float)
+        target_pos = np.asarray(sim_state.get("target_pos", [0.0, 0.0, 0.0]), dtype=float)
+        true_obj_rel = obj_pos - ee_pos
+        true_target_rel = target_pos - ee_pos
+
+        true_reach_err_vec = true_obj_rel - reach_ref
+        true_descend_err_vec = true_obj_rel - descend_ref
+        true_preplace_err_vec = true_target_rel - self.task_cfg.preplace_target_rel
+        true_place_err_vec = true_target_rel - self.task_cfg.place_target_rel
+        obs_reach_err_vec = obj_rel - reach_ref
+        obs_descend_err_vec = obj_rel - descend_ref
+        obs_preplace_err_vec = target_rel - self.task_cfg.preplace_target_rel
+        obs_place_err_vec = target_rel - self.task_cfg.place_target_rel
+
+        return {
+            "obs_reach_x_error": float(abs(obs_reach_err_vec[0])),
+            "obs_reach_y_error": float(abs(obs_reach_err_vec[1])),
+            "obs_reach_z_error": float(abs(obs_reach_err_vec[2])),
+            "obs_reach_xy_error": float(np.linalg.norm(obs_reach_err_vec[:2])),
+            "obs_descend_x_error": float(abs(obs_descend_err_vec[0])),
+            "obs_descend_y_error": float(abs(obs_descend_err_vec[1])),
+            "obs_descend_z_error": float(abs(obs_descend_err_vec[2])),
+            "obs_descend_xy_error": float(np.linalg.norm(obs_descend_err_vec[:2])),
+            "obs_preplace_x_error": float(abs(obs_preplace_err_vec[0])),
+            "obs_preplace_y_error": float(abs(obs_preplace_err_vec[1])),
+            "obs_preplace_z_error": float(abs(obs_preplace_err_vec[2])),
+            "obs_preplace_xy_error": float(np.linalg.norm(obs_preplace_err_vec[:2])),
+            "obs_place_x_error": float(abs(obs_place_err_vec[0])),
+            "obs_place_y_error": float(abs(obs_place_err_vec[1])),
+            "obs_place_z_error": float(abs(obs_place_err_vec[2])),
+            "obs_place_xy_error": float(np.linalg.norm(obs_place_err_vec[:2])),
+            "true_reach_x_error": float(abs(true_reach_err_vec[0])),
+            "true_reach_y_error": float(abs(true_reach_err_vec[1])),
+            "true_reach_z_error": float(abs(true_reach_err_vec[2])),
+            "true_reach_xy_error": float(np.linalg.norm(true_reach_err_vec[:2])),
+            "true_descend_x_error": float(abs(true_descend_err_vec[0])),
+            "true_descend_y_error": float(abs(true_descend_err_vec[1])),
+            "true_descend_z_error": float(abs(true_descend_err_vec[2])),
+            "true_descend_xy_error": float(np.linalg.norm(true_descend_err_vec[:2])),
+            "true_preplace_x_error": float(abs(true_preplace_err_vec[0])),
+            "true_preplace_y_error": float(abs(true_preplace_err_vec[1])),
+            "true_preplace_z_error": float(abs(true_preplace_err_vec[2])),
+            "true_preplace_xy_error": float(np.linalg.norm(true_preplace_err_vec[:2])),
+            "true_place_x_error": float(abs(true_place_err_vec[0])),
+            "true_place_y_error": float(abs(true_place_err_vec[1])),
+            "true_place_z_error": float(abs(true_place_err_vec[2])),
+            "true_place_xy_error": float(np.linalg.norm(true_place_err_vec[:2])),
+            "obs_preplace_error": float(np.linalg.norm(target_rel - self.task_cfg.preplace_target_rel)),
+            "obs_place_error": float(np.linalg.norm(target_rel - self.task_cfg.place_target_rel)),
+            "true_ee_z": float(ee_pos[2]),
+            "true_obj_z": float(obj_pos[2]),
+            "workspace_min_z": float(
+                np.asarray(
+                    getattr(self.simulator, "workspace_min", np.array([0.0, 0.0, 0.0], dtype=float)),
+                    dtype=float,
+                )[2]
+            ),
+        }
+
+    def _descend_gate_for_logging(self, observation):
+        if self.last_descend_gate is not None:
+            return self.last_descend_gate
+        if self.task_state is None or Phase(self.task_state.phase) != Phase.Descend:
+            return None
+        return self._compute_descend_gate(
+            obj_rel=observation.get("o_obj", [0.0, 0.0, 0.0]),
+            step_in_phase=int(self.task_state.step_in_phase),
+            descend_contact_hold=int(self.task_state.descend_contact_hold),
+            descend_ready_counter=int(self.task_state.descend_ready_counter),
+        )
+
+    def _log_heartbeat(self, sim_state, observation, action):
+        phase = self._phase_name()
+        contact = int(observation.get("o_contact", 0))
+        grip_cmd = int(action.get("grip", 0))
+        m = self._collect_log_metrics(sim_state, observation)
+        msg = f"[HB] step={self.step_count} phase={phase} contact={contact} grip={grip_cmd}"
+
+        if phase == Phase.ReachAbove.value:
+            msg += (
+                f" x={m['true_reach_x_error']:.4f} "
+                f"y={m['true_reach_y_error']:.4f} "
+                f"xy={m['true_reach_xy_error']:.4f}/{self.task_cfg.reach_xy_threshold:.4f} "
+                f"z={m['true_reach_z_error']:.4f}/{self.task_cfg.reach_z_threshold:.4f}"
+            )
+
+        elif phase == Phase.Descend.value:
+            msg += (
+                f" x={m['true_descend_x_error']:.4f}/{self.task_cfg.descend_x_threshold:.4f} "
+                f"y={m['true_descend_y_error']:.4f}/{self.task_cfg.descend_y_threshold:.4f} "
+                f"xy={m['true_descend_xy_error']:.4f}/{self.task_cfg.descend_threshold:.4f} "
+                f"z={m['true_descend_z_error']:.4f}/{self.task_cfg.descend_z_threshold:.4f}"
+            )
+            gate = self._descend_gate_for_logging(observation)
+            if gate is not None:
+                blockers = ",".join(gate.get("blockers", [])) if gate.get("blockers") else "-"
+                msg += (
+                    f" ee_z={m['true_ee_z']:.4f} obj_z={m['true_obj_z']:.4f} min_z={m['workspace_min_z']:.4f} "
+                    f"gate={gate['trigger']} "
+                    f"ready={gate['ready_counter']}/{self.task_cfg.descend_ready_steps} "
+                    f"hold={gate['contact_hold']}/{self.task_cfg.descend_stop_contact_steps} "
+                    f"step={gate['step_in_phase']}/{self.task_cfg.descend_max_steps} "
+                    f"blockers={blockers}"
+                )
+        elif phase == Phase.Close.value and self.task_state is not None:
+            msg += (
+                f" x={m['true_descend_x_error']:.4f}/{self.task_cfg.descend_x_threshold:.4f} "
+                f"y={m['true_descend_y_error']:.4f}/{self.task_cfg.descend_y_threshold:.4f} "
+                f"z={m['true_descend_z_error']:.4f}/{self.task_cfg.descend_z_threshold:.4f} "
+                f" close_step={int(self.task_state.step_in_phase)}/{self.task_cfg.close_hold_steps} "
+                f"stable_contact={int(self.task_state.stable_contact_counter)}/{self.task_cfg.stable_contact_steps}"
+            )
+        elif phase == Phase.LiftTest.value and self.task_state is not None:
+            msg += (
+                f" lift_step={int(self.task_state.lift_test_timer)}/{self.task_cfg.lift_test_steps} "
+                f"ee_z={m['true_ee_z']:.4f} obj_z={m['true_obj_z']:.4f}"
+            )
+        elif phase == Phase.Transit.value:
+            msg += f" ee_z={m['true_ee_z']:.4f} transit_target_z={self.task_cfg.transit_height:.4f}"
+        elif phase == Phase.MoveToPlaceAbove.value:
+            msg += (
+                f" x={m['true_preplace_x_error']:.4f} "
+                f"y={m['true_preplace_y_error']:.4f} "
+                f"xy={m['true_preplace_xy_error']:.4f}/{self.task_cfg.preplace_xy_threshold:.4f} "
+                f"z={m['true_preplace_z_error']:.4f}/{self.task_cfg.preplace_z_threshold:.4f} "
+                f"norm={m['obs_preplace_error']:.4f}/{self.task_cfg.preplace_threshold:.4f} "
+                f"ee_z={m['true_ee_z']:.4f}"
+            )
+        elif phase == Phase.DescendToPlace.value:
+            msg += (
+                f" x={m['true_place_x_error']:.4f} "
+                f"y={m['true_place_y_error']:.4f} "
+                f"xy={m['true_place_xy_error']:.4f}/{self.task_cfg.place_xy_threshold:.4f} "
+                f"z={m['true_place_z_error']:.4f}/{self.task_cfg.place_z_threshold:.4f} "
+                f"norm={m['obs_place_error']:.4f}/{self.task_cfg.place_threshold:.4f} "
+                f"ee_z={m['true_ee_z']:.4f} obj_z={m['true_obj_z']:.4f}"
+            )
+        elif phase == Phase.Open.value and self.task_state is not None:
+            msg += (
+                f" open_step={int(self.task_state.step_in_phase)}/{self.task_cfg.open_hold_steps} "
+                f"x={m['true_place_x_error']:.4f} y={m['true_place_y_error']:.4f} z={m['true_place_z_error']:.4f}"
+            )
+        elif phase == Phase.Retreat.value and self.task_state is not None:
+            msg += f" retreat_step={int(self.task_state.step_in_phase)}/{self.task_cfg.retreat_steps}"
+        else:
+            msg += (
+                f" reach=({m['true_reach_x_error']:.4f},{m['true_reach_y_error']:.4f},{m['true_reach_z_error']:.4f}) "
+                f"desc=({m['true_descend_x_error']:.4f},{m['true_descend_y_error']:.4f},{m['true_descend_z_error']:.4f})"
+            )
+
+        if self.log_pose_debug:
+            hand_roll, hand_pitch, hand_yaw = self._quat_wxyz_to_rpy(
+                sim_state.get("hand_quat_wxyz", [1.0, 0.0, 0.0, 0.0])
+            )
+            joint7_pos = float(sim_state.get("joint7_pos", 0.0))
+            msg += (
+                f" joint7={joint7_pos:.4f} "
+                f"rpy=({hand_roll:.4f},{hand_pitch:.4f},{hand_yaw:.4f})"
+            )
+
+        print(msg)
 
     def _log_step(self, sim_state, observation, action):
         ee = np.asarray(observation["o_ee"], dtype=float)
@@ -430,80 +616,7 @@ class ActiveInferenceAgent:
         self._maybe_pause_for_inspection(sim_state, observation)
 
         if self.step_count % self.log_every_steps == 0:
-            phase_label = (
-                self.current_belief.get("phase", "Reach")
-                if self.control_mode == "active_inference" and self.current_belief is not None
-                else self.task_state.phase
-            )
-            if self.control_mode == "active_inference":
-                pregrasp_ref = np.array([0.0, 0.0, -0.08], dtype=float)
-                descend_ref = pregrasp_ref
-            else:
-                pregrasp_ref = self.task_cfg.pregrasp_obj_rel
-                descend_ref = self.task_cfg.grasp_obj_rel
-            true_obj_rel = np.asarray(sim_state["obj_pos"], dtype=float) - np.asarray(sim_state["ee_pos"], dtype=float)
-            true_pregrasp_err_vec = true_obj_rel - pregrasp_ref
-            true_pregrasp_x_error = float(abs(true_pregrasp_err_vec[0]))
-            true_pregrasp_y_error = float(abs(true_pregrasp_err_vec[1]))
-            true_pregrasp_z_error = float(abs(true_pregrasp_err_vec[2]))
-            true_descend_x_error = float(abs((true_obj_rel - descend_ref)[0]))
-            true_descend_y_error = float(abs((true_obj_rel - descend_ref)[1]))
-            true_descend_z_error = float(abs((true_obj_rel - descend_ref)[2]))
-
-            print(f"Step: {self.step_count}")
-            print("Phase:", phase_label)
-            phase_name = phase_label.value if isinstance(phase_label, Phase) else str(phase_label)
-            if phase_name == Phase.ReachAbove.value:
-                print("True Reach X error:", true_pregrasp_x_error)
-                print("True Reach Y error:", true_pregrasp_y_error)
-                print("True Reach Z error:", true_pregrasp_z_error)
-            elif phase_name == Phase.Descend.value:
-                print("True Descend X error:", true_descend_x_error)
-                print("True Descend Y error:", true_descend_y_error)
-                print("True Descend Z error:", true_descend_z_error)
-                ee_z = float(np.asarray(sim_state["ee_pos"], dtype=float)[2])
-                obj_z = float(np.asarray(sim_state["obj_pos"], dtype=float)[2])
-                ws_min_z = float(getattr(self.simulator, "workspace_min", np.array([0.0, 0.0, 0.0], dtype=float))[2])
-                print("True EE Z:", ee_z)
-                print("True Obj Z:", obj_z)
-                print("Workspace Min Z:", ws_min_z)
-                gate = self.last_descend_gate
-                if gate is None and self.task_state is not None:
-                    gate = self._compute_descend_gate(
-                        obj_rel=observation.get("o_obj", [0.0, 0.0, 0.0]),
-                        step_in_phase=int(self.task_state.step_in_phase),
-                        descend_contact_hold=int(self.task_state.descend_contact_hold),
-                        descend_ready_counter=int(self.task_state.descend_ready_counter),
-                    )
-                if gate is not None:
-                    blockers = ",".join(gate.get("blockers", [])) if gate.get("blockers") else "-"
-                    print(
-                        "Descend Story:",
-                        f"trigger={gate['trigger']}",
-                        f"x={gate['x_err']:.4f}/{self.task_cfg.descend_x_threshold:.3f}",
-                        f"y={gate['y_err']:.4f}/{self.task_cfg.descend_y_threshold:.3f}",
-                        f"z={gate['z_err']:.4f}/{self.task_cfg.descend_z_threshold:.3f}",
-                        f"ready={gate['ready_counter']}/{self.task_cfg.descend_ready_steps}",
-                        f"contact_hold={gate['contact_hold']}/{self.task_cfg.descend_stop_contact_steps}",
-                        f"step={gate['step_in_phase']}/{self.task_cfg.descend_max_steps}",
-                        f"blockers={blockers}",
-                    )
-            else:
-                print("True Reach X error:", true_pregrasp_x_error)
-                print("True Reach Y error:", true_pregrasp_y_error)
-                print("True Reach Z error:", true_pregrasp_z_error)
-                print("True Descend X error:", true_descend_x_error)
-                print("True Descend Y error:", true_descend_y_error)
-                print("True Descend Z error:", true_descend_z_error)
-            if self.log_pose_debug:
-                hand_roll, hand_pitch, hand_yaw = self._quat_wxyz_to_rpy(
-                    sim_state.get("hand_quat_wxyz", [1.0, 0.0, 0.0, 0.0])
-                )
-                joint7_pos = float(sim_state.get("joint7_pos", 0.0))
-                print("Joint7 angle:", joint7_pos)
-                print("Hand RPY:", [hand_roll, hand_pitch, hand_yaw])
-            print("Contact:", int(observation.get("o_contact", 0)))
-            print("-" * 40)
+            self._log_heartbeat(sim_state, observation, action)
 
         self.actuator_backend.apply_action(action)
         self.step_count += 1
@@ -574,33 +687,9 @@ class ActiveInferenceAgent:
         """
         Event logs for key state/action transitions so run behavior is easier to inspect.
         """
-        if self.control_mode == "active_inference":
-            phase = (
-                str(self.current_belief.get("phase"))
-                if self.current_belief is not None
-                else "Reach"
-            )
-            reach_ref = np.array([0.0, 0.0, -0.08], dtype=float)
-        else:
-            phase = self.task_state.phase.value if self.task_state is not None else Phase.ReachAbove.value
-            reach_ref = self.task_cfg.pregrasp_obj_rel
+        phase = self._phase_name()
         contact = int(observation.get("o_contact", 0))
-        obj_rel = np.asarray(observation.get("o_obj", [0.0, 0.0, 0.0]), dtype=float)
-        reach_error = float(np.linalg.norm(obj_rel - reach_ref))
-        pregrasp_x_error = float(abs((obj_rel - reach_ref)[0]))
-        pregrasp_y_error = float(abs((obj_rel - reach_ref)[1]))
-        pregrasp_z_error = float(abs((obj_rel - reach_ref)[2]))
-        descend_ref = self.task_cfg.grasp_obj_rel if self.control_mode != "active_inference" else reach_ref
-        descend_x_error = float(abs((obj_rel - descend_ref)[0]))
-        descend_y_error = float(abs((obj_rel - descend_ref)[1]))
-        descend_z_error = float(abs((obj_rel - descend_ref)[2]))
-        true_obj_rel = np.asarray(sim_state["obj_pos"], dtype=float) - np.asarray(sim_state["ee_pos"], dtype=float)
-        true_pregrasp_x_error = float(abs((true_obj_rel - reach_ref)[0]))
-        true_pregrasp_y_error = float(abs((true_obj_rel - reach_ref)[1]))
-        true_pregrasp_z_error = float(abs((true_obj_rel - reach_ref)[2]))
-        true_descend_x_error = float(abs((true_obj_rel - descend_ref)[0]))
-        true_descend_y_error = float(abs((true_obj_rel - descend_ref)[1]))
-        true_descend_z_error = float(abs((true_obj_rel - descend_ref)[2]))
+        m = self._collect_log_metrics(sim_state, observation)
 
         if self.prev_phase is None:
             self.prev_phase = phase
@@ -609,6 +698,7 @@ class ActiveInferenceAgent:
             self.prev_action_grip = int(action.get("grip", 0))
             print(
                 f"[Init] phase={phase} contact={contact} "
+                f"log_format=v2 "
                 f"pause_on_reach_to_descend={int(self.pause_on_reach_to_descend)} "
                 f"pause_once={int(self.pause_on_reach_to_descend_once)} "
                 f"pause_on_phase_change={int(self.pause_on_phase_change)} "
@@ -617,24 +707,27 @@ class ActiveInferenceAgent:
             return
 
         if phase != self.prev_phase:
-            msg = f"[Phase] step={self.step_count} {self.prev_phase} -> {phase} "
-            if phase == Phase.ReachAbove.value:
-                msg += (
-                    f"true_reach_x_error={true_pregrasp_x_error:.4f} "
-                    f"true_reach_y_error={true_pregrasp_y_error:.4f} "
-                    f"true_reach_z_error={true_pregrasp_z_error:.4f} "
-                )
+            msg = (
+                f"[Phase] step={self.step_count} {self.prev_phase}->{phase} contact={contact} "
+                f"reach=({m['true_reach_x_error']:.4f},{m['true_reach_y_error']:.4f},{m['true_reach_z_error']:.4f}) "
+                f"desc=({m['true_descend_x_error']:.4f},{m['true_descend_y_error']:.4f},{m['true_descend_z_error']:.4f})"
+            )
+            if self.prev_phase == Phase.Descend.value and phase == Phase.Close.value:
+                gate = self.last_descend_gate
+                msg += f" trigger={self.last_transition_reason or 'unknown'}"
+                if gate is not None:
+                    blockers = ",".join(gate.get("blockers", [])) if gate.get("blockers") else "-"
+                    msg += (
+                        f" gate_ready={gate['ready_counter']}/{self.task_cfg.descend_ready_steps} "
+                        f"gate_hold={gate['contact_hold']}/{self.task_cfg.descend_stop_contact_steps} "
+                        f"gate_blockers={blockers}"
+                    )
             elif phase == Phase.Descend.value:
-                msg += (
-                    f"true_descend_x_error={true_descend_x_error:.4f} "
-                    f"true_descend_y_error={true_descend_y_error:.4f} "
-                    f"true_descend_z_error={true_descend_z_error:.4f} "
-                )
-            elif phase == Phase.Close.value and self.prev_phase == Phase.Descend.value:
-                msg += f"trigger={self.last_transition_reason or 'unknown'} "
-            else:
-                msg += f"true_reach_error={float(np.linalg.norm(true_obj_rel - reach_ref)):.4f} "
-            msg += f"contact={contact}"
+                msg += f" ee_z={m['true_ee_z']:.4f} obj_z={m['true_obj_z']:.4f}"
+            elif phase == Phase.MoveToPlaceAbove.value:
+                msg += f" preplace_err={m['obs_preplace_error']:.4f}"
+            elif phase == Phase.DescendToPlace.value:
+                msg += f" place_err={m['obs_place_error']:.4f}"
             print(msg)
             if self.pause_on_phase_change:
                 self._queue_pause(f"{self.prev_phase}->{phase}")
@@ -656,14 +749,16 @@ class ActiveInferenceAgent:
             self._queue_pause(f"GripStart(phase={phase})")
             print(
                 f"[GripStart] step={self.step_count} phase={phase} "
-                f"true_descend_x_error={true_descend_x_error:.4f} "
-                f"true_descend_y_error={true_descend_y_error:.4f} "
-                f"true_descend_z_error={true_descend_z_error:.4f}"
+                f"desc=({m['true_descend_x_error']:.4f},{m['true_descend_y_error']:.4f},{m['true_descend_z_error']:.4f})"
             )
 
         if contact != self.prev_contact and self.log_contact_events:
             state = "ON" if contact == 1 else "OFF"
-            print(f"[Contact{state}] step={self.step_count} reach_error={reach_error:.4f}")
+            print(
+                f"[Contact{state}] step={self.step_count} "
+                f"reach=({m['obs_reach_x_error']:.4f},{m['obs_reach_y_error']:.4f},{m['obs_reach_z_error']:.4f}) "
+                f"desc=({m['obs_descend_x_error']:.4f},{m['obs_descend_y_error']:.4f},{m['obs_descend_z_error']:.4f})"
+            )
 
         if self.escape_active != self.prev_escape_active:
             label = {

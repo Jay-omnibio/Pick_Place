@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Dict, Optional
 
@@ -15,7 +15,7 @@ class Phase(str, Enum):
     Transit = "Transit"  # Collimator-style waypoint: lift to safe height before moving to place
     MoveToPlaceAbove = "MoveToPlaceAbove"
     DescendToPlace = "DescendToPlace"
-    Open = "Open"
+    Open = "Open" # Hold open for a while to ensure object release before retreating; also gives more time for contact to register if place was slightly off and object is still in gripper.
     Retreat = "Retreat"
     Done = "Done"
     Failure = "Failure"
@@ -27,57 +27,56 @@ class TaskConfig:
     # Note: o_obj = obj_world - ee_world, so a less-negative Z means EE is closer to the object.
     # For stable top-down descend, keep X/Y identical between pregrasp and grasp;
     # only Z should change across ReachAbove -> Descend.
-    pregrasp_obj_rel: np.ndarray = field(
-        default_factory=lambda: np.array([0.001, 0.001, -0.08], dtype=float)
-    )
-    grasp_obj_rel: np.ndarray = field(default_factory=lambda: np.array([-0.005, 0.001, 0], dtype=float))
-    preplace_target_rel: np.ndarray = field(
-        default_factory=lambda: np.array([0.01, 0.01, -0.08], dtype=float)
-    )
-    place_target_rel: np.ndarray = field(
-        default_factory=lambda: np.array([0.001, 0.001, 0], dtype=float)
-    )
+    pregrasp_obj_rel: np.ndarray
+    grasp_obj_rel: np.ndarray
+    preplace_target_rel: np.ndarray
+    place_target_rel: np.ndarray
 
     # Thresholds (wide enough to transition when "close enough" before drift).
     # Tight XY centering before starting Descend.
-    reach_xy_threshold: float = 0.012
-    reach_z_threshold: float = 0.025
-    descend_threshold: float = 0.02
-    descend_xy_threshold: float = 0.50
+    reach_xy_threshold: float
+    reach_z_threshold: float
+    descend_threshold: float
+    descend_xy_threshold: float
     # Tight XY centering required to finish Descend -> Close.
-    descend_x_threshold: float = 0.01
-    descend_y_threshold: float = 0.05
-    descend_z_threshold: float = 0.01
-    descend_contact_z_threshold: float = 0.00 # 
-    descend_timeout_xy_threshold: float = 0.05 
-    descend_timeout_x_threshold: float = 0.05
-    descend_timeout_y_threshold: float = 0.05
-    descend_timeout_z_threshold: float = 0.05
-    descend_max_steps: int = 220 # 
-    preplace_threshold: float = 0.04 
-    place_threshold: float = 0.03
+    descend_x_threshold: float
+    descend_y_threshold: float
+    descend_z_threshold: float
+    descend_contact_z_threshold: float
+    descend_timeout_xy_threshold: float
+    descend_timeout_x_threshold: float
+    descend_timeout_y_threshold: float
+    descend_timeout_z_threshold: float
+    descend_max_steps: int
+    preplace_threshold: float
+    place_threshold: float
+    # Axis-wise place gates (kept alongside legacy norm thresholds for robustness).
+    preplace_xy_threshold: float
+    preplace_z_threshold: float
+    place_xy_threshold: float
+    place_z_threshold: float
 
     # Timing / hysteresis.
-    stable_contact_steps: int = 8
-    close_hold_steps: int = 100 # chnaged from 25 to 100 to give more time for stable contact to be detected
-    lift_test_steps: int = 18
-    open_hold_steps: int = 12
-    retreat_steps: int = 24
+    stable_contact_steps: int
+    close_hold_steps: int
+    lift_test_steps: int
+    open_hold_steps: int
+    retreat_steps: int
 
     # Lift-test pass condition (object should remain in contact / not “drift away” too much).
-    lift_test_obj_rel_drift_max: float = 0.06
+    lift_test_obj_rel_drift_max: float
 
     # Transit (Collimator waypoint): safe height before moving to place.
-    transit_height: float = 0.35
-    transit_z_threshold: float = 0.02
+    transit_height: float
+    transit_z_threshold: float
 
     # Retry policy.
-    max_retries: int = 3
-    retry_reach_cooldown_steps: int = 20
+    max_retries: int
+    retry_reach_cooldown_steps: int
 
     # Guarded descend: stop on contact after this many consecutive contact steps (hysteresis).
-    descend_stop_contact_steps: int = 2
-    descend_ready_steps: int = 6  
+    descend_stop_contact_steps: int
+    descend_ready_steps: int
 
 
 @dataclass(frozen=True)
@@ -116,7 +115,7 @@ def _update_contact_counter(prev: int, contact: int) -> int:
     return 0
 
 
-def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig = TaskConfig()) -> TaskState:
+def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig) -> TaskState:
     """
     Pure task-level state machine.
 
@@ -305,7 +304,9 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig = TaskConfig
     elif phase == Phase.MoveToPlaceAbove:
         # Navigate to preplace above target.
         err = o_target - cfg.preplace_target_rel
-        if _norm(err) <= cfg.preplace_threshold:
+        preplace_xy_ok = _xy_norm(err) <= cfg.preplace_xy_threshold
+        preplace_z_ok = abs(float(err[2])) <= cfg.preplace_z_threshold
+        if (_norm(err) <= cfg.preplace_threshold) or (preplace_xy_ok and preplace_z_ok):
             return replace(state, phase=Phase.DescendToPlace, step_in_phase=0, reach_cooldown=reach_cooldown)
         # Drop detection -> restart.
         if contact == 0:
@@ -313,7 +314,9 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig = TaskConfig
 
     elif phase == Phase.DescendToPlace:
         err = o_target - cfg.place_target_rel
-        if _norm(err) <= cfg.place_threshold:
+        place_xy_ok = _xy_norm(err) <= cfg.place_xy_threshold
+        place_z_ok = abs(float(err[2])) <= cfg.place_z_threshold
+        if (_norm(err) <= cfg.place_threshold) or (place_xy_ok and place_z_ok):
             return replace(state, phase=Phase.Open, step_in_phase=0, reach_cooldown=reach_cooldown)
         if contact == 0:
             return replace(state, phase=Phase.ReachAbove, step_in_phase=0, stable_contact_counter=0)

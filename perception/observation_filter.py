@@ -105,13 +105,19 @@ class ObservationFilter:
             self.kalman_measure_std_ee,
         )
 
-        return {
+        filtered = {
             "o_ee": self._x_ee.tolist(),
             "o_obj": self._x_obj.tolist(),
             "o_target": self._x_target.tolist(),
             "o_grip": obs["o_grip"],
             "o_contact": obs["o_contact"],
         }
+        # Pass through extra scalar/vector observations that do not use this filter,
+        # such as object yaw used for dynamic gripper alignment.
+        for k, v in obs.items():
+            if k not in filtered:
+                filtered[k] = v
+        return filtered
 
     def _reject_outlier_3d(
         self,
