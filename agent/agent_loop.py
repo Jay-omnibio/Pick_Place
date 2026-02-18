@@ -512,6 +512,10 @@ class ActiveInferenceAgent:
                 f"desc=({m['true_descend_x_error']:.4f},{m['true_descend_y_error']:.4f},{m['true_descend_z_error']:.4f})"
             )
 
+        if self.control_mode == "active_inference" and self.ai_bt is not None:
+            bt_reason = self.ai_bt.last_reason if self.ai_bt.last_reason else "-"
+            msg += f" bt={self.ai_bt.status.value} bt_reason={bt_reason}"
+
         if self.log_pose_debug:
             hand_roll, hand_pitch, hand_yaw = self._quat_wxyz_to_rpy(
                 sim_state.get("hand_quat_wxyz", [1.0, 0.0, 0.0, 0.0])
@@ -784,6 +788,14 @@ class ActiveInferenceAgent:
                     previous_belief=self.current_belief,
                     params=self.active_inference_params,
                 )
+                if self.ai_bt is not None:
+                    bt_result = self.ai_bt.tick(self.current_belief)
+                    if bt_result.get("recover", False):
+                        self.current_belief = self.ai_bt.recover_belief(self.current_belief)
+                        print(
+                            f"[AI-BT] recover reason={self.ai_bt.last_reason} "
+                            f"retry={int(self.current_belief.get('retry_count', 0))}"
+                        )
                 action = select_action(self.current_belief, params=self.active_inference_params)
         else:
             prev_task_state = self.task_state
