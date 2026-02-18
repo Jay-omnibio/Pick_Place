@@ -1,0 +1,105 @@
+inference:
+  # ---------- Object-relative targets ----------
+  # Format: [x, y, z] in meters, relative to EE->object frame used by observation.
+  reach_obj_rel: [-0.02, 0.00, -0.06]          # Reach target above object.
+  align_obj_rel: [-0.02, 0.0, -0.06]          # Align target before descend.
+  descend_obj_rel: [-0.01, 0.0, 0.02]        # Descend/grasp target near object top.
+
+  # ---------- Phase gates ----------
+  approach_threshold: 0.03                  # Reach -> Align when reach error < this.
+  align_threshold: 0.025                    # Align considered good when error < this.
+  descend_threshold: 0.01                   # Descend norm threshold (plus axis checks).
+
+  # ---------- Phase timers ----------
+  align_max_steps: 300                      # Max steps allowed in Align.
+  align_min_steps: 6                        # Min steps in Align before transition allowed.
+  pregrasp_hold_steps: 100                  # Hold duration before Descend.
+  pregrasp_hold_ready_grace_steps: 30       # Extra wait if gripper-open-ready is late.
+  descend_max_steps: 1000                   # Base Descend timeout budget.
+
+  # ---------- Descend strict axis thresholds ----------
+  descend_x_threshold: 0.015                # Required X error for strict descend success.
+  descend_y_threshold: 0.015                # Required Y error for strict descend success.
+  descend_z_threshold: 0.01                 # Required Z error for strict descend success.
+
+  # ---------- Descend timeout-near thresholds ----------
+  # If timeout is hit, transition can proceed only when inside these looser bounds.
+  descend_timeout_x_threshold: 0.03
+  descend_timeout_y_threshold: 0.03
+  descend_timeout_z_threshold: 0.02
+
+  # ---------- Descend progress watchdog ----------
+  descend_progress_eps: 0.0008              # Improvement needed to count as progress.
+  descend_stall_steps: 40                   # No-progress steps before treated as stall.
+  descend_timeout_extension_steps: 40       # Extra steps granted when still improving.
+  descend_max_timeout_extensions: 3         # Max number of timeout extensions.
+
+  # ---------- Close/Lift/Test behavior ----------
+  close_hold_steps: 20                      # Close-hold dwell before lift test.
+  grasp_search_steps: 60                    # Max close-hold search before retry.
+  grasp_stable_steps_for_lift: 10           # Stable grasp steps needed to lift.
+  reach_reentry_cooldown_steps: 20          # Cooldown before re-entering Reach after retry.
+  lift_test_steps: 16                       # Lift-test duration.
+  lift_test_obj_rel_drift_max: 0.06         # Max object drift during lift test.
+  max_retries: 3                            # Retry cap before reset behavior.
+
+  # ---------- Belief smoothing / reacquire ----------
+  alpha_ee: 0.7                             # EE observation smoothing gain.
+  alpha_obj_default: 0.7                    # Object smoothing gain (non-Reach phases).
+  alpha_obj_reach: 0.9                      # Object smoothing gain (Reach phase).
+  alpha_target: 0.8                         # Target smoothing gain.
+  obj_reacquire_jump: 0.05                  # If object jump > this, trust current obs more.
+
+  # ---------- Contact hysteresis ----------
+  contact_on_count: 2                       # Contact debounce to latch grasp=1.
+  contact_off_count: 2                      # Contact debounce to unlatch grasp=0.
+
+  # ---------- Reach watchdog / arc / yaw-align ----------
+  reach_arc_angle_trigger_deg: 50.0         # Start turn lock when angular gap exceeds this.
+  reach_arc_release_deg: 20.0               # Release turn lock when angular gap drops below this.
+  reach_progress_eps: 0.002                 # Reach improvement epsilon for stall tracking.
+  reach_stall_steps: 90                     # No-progress steps before watchdog fallback.
+  reach_yaw_align_xy_enter: 0.20            # Enter yaw-align hold when XY error < this.
+  reach_yaw_align_steps: 100                # Number of yaw-align hold steps.
+  grip_close_ready_max_width: 0.035         # Width threshold to consider close-ready with contact.
+
+  # ---------- Post-lift placement pipeline ----------
+  preplace_target_rel: [0.01, 0.01, -0.08]  # MoveToPlaceAbove goal in EE->target frame.
+  place_target_rel: [0.001, 0.001, 0.0]     # DescendToPlace goal in EE->target frame.
+  preplace_threshold: 0.04                  # Norm threshold for MoveToPlaceAbove completion.
+  place_threshold: 0.03                     # Norm threshold for DescendToPlace completion.
+  preplace_xy_threshold: 0.02               # XY threshold for MoveToPlaceAbove.
+  preplace_z_threshold: 0.03                # Z threshold for MoveToPlaceAbove.
+  place_xy_threshold: 0.02                  # XY threshold for DescendToPlace.
+  place_z_threshold: 0.01                   # Z threshold for DescendToPlace.
+  transit_height: 0.35                      # Safe height before moving to place.
+  transit_z_threshold: 0.02                 # Transit completion tolerance on Z.
+  open_hold_steps: 80                       # Hold-open duration before retreat.
+  retreat_steps: 24                         # Retreat duration before Done.
+  retreat_move: [-0.012, 0.0, 0.10]         # Retreat motion direction (normalized in policy).
+
+action_selection:
+  # ---------- Expected Free Energy / prediction ----------
+  lambda_epistemic: 0.1                     # Epistemic weight in EFE.
+  delta: 0.022                              # Generic step for fallback EFE scan.
+  reach_delta: 0.026                        # Max cartesian step in Reach.
+  action_effectiveness: 0.4                 # Belief dynamics coupling factor.
+
+  # ---------- Reach XY/Z blending ----------
+  reach_axis_threshold_x: 0.03              # X normalization for Reach axis-priority.
+  reach_axis_threshold_y: 0.03              # Y normalization for Reach axis-priority.
+  reach_z_blend_start: 0.06                 # Start adding Z when XY max error drops below this.
+  reach_z_blend_full: 0.02                  # Full Z when XY max error drops below this.
+  reach_step_min: 0.008                     # Reach minimum step floor.
+
+  # ---------- Reach arc/spiral ----------
+  reach_arc_enabled: true                   # Enable arc mode when turn-lock is active.
+  reach_arc_max_theta_step_deg: 12.0        # Max angular step per control step.
+  reach_arc_radial_step_max: 0.03           # Max radial change per control step.
+  reach_arc_min_radius: 0                   # Minimum allowed radius in arc mode.
+  reach_arc_max_radius: 0.78                # Maximum allowed radius in arc mode.
+
+  # ---------- Phase-local step caps ----------
+  grasp_step: 0.010                         # Max step in Descend/grasp approach.
+  align_step: 0.012                         # Max step in Align.
+  pregrasp_hold_step: 0.006                 # Max correction step in PreGraspHold.

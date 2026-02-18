@@ -24,6 +24,8 @@ class Phase(str, Enum):
 @dataclass(frozen=True)
 class TaskConfig:
     # Geometry targets in EE-relative coordinates.
+    # XY components are interpreted in object-local axes (yaw-aware).
+    # Z remains world vertical in the same relative convention.
     # Note: o_obj = obj_world - ee_world, so a less-negative Z means EE is closer to the object.
     # For stable top-down descend, keep X/Y identical between pregrasp and grasp;
     # only Z should change across ReachAbove -> Descend.
@@ -31,19 +33,21 @@ class TaskConfig:
     grasp_obj_rel: np.ndarray
     preplace_target_rel: np.ndarray
     place_target_rel: np.ndarray
+    # Reach/Descend error frame:
+    # - True: object-local XY (current behavior, yaw-aware)
+    # - False: world-frame XY (legacy behavior)
+    use_object_local_xy_errors: bool
 
     # Thresholds (wide enough to transition when "close enough" before drift).
     # Tight XY centering before starting Descend.
     reach_xy_threshold: float
     reach_z_threshold: float
     descend_threshold: float
-    descend_xy_threshold: float
     # Tight XY centering required to finish Descend -> Close.
     descend_x_threshold: float
     descend_y_threshold: float
     descend_z_threshold: float
     descend_contact_z_threshold: float
-    descend_timeout_xy_threshold: float
     descend_timeout_x_threshold: float
     descend_timeout_y_threshold: float
     descend_timeout_z_threshold: float
@@ -105,6 +109,29 @@ def _xy_norm(v) -> float:
     return float(np.linalg.norm(v[:2]))
 
 
+def _world_to_object_rel(rel_world: np.ndarray, obj_yaw: float) -> np.ndarray:
+    """
+    Convert EE-relative vector from world XY axes into object-local XY axes.
+    Z is unchanged.
+    """
+    r = np.asarray(rel_world, dtype=float).copy()
+    c = float(np.cos(float(obj_yaw)))
+    s = float(np.sin(float(obj_yaw)))
+    x_w, y_w = float(r[0]), float(r[1])
+    # local = Rz(-yaw) * world
+    r[0] = c * x_w + s * y_w
+    r[1] = -s * x_w + c * y_w
+    return r
+
+
+def _reach_descend_rel(rel_world: np.ndarray, obj_yaw: float, use_object_local_xy_errors: bool) -> np.ndarray:
+    rel = np.asarray(rel_world, dtype=float)
+    if bool(use_object_local_xy_errors):
+        return _world_to_object_rel(rel, obj_yaw)
+    # Legacy mode: keep world-frame XY directly.
+    return rel.copy()
+
+
 def _clamp_int(x: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(x)))
 
@@ -121,6 +148,7 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig) -> TaskStat
 
     obs must include:
       - o_obj: object position relative to EE (3,)
+      - o_obj_yaw: object yaw in world frame (radians)
       - o_target: target position relative to EE (3,)
       - o_ee: EE world position (3,) [needed for Transit]
       - o_contact: {0,1}
@@ -136,6 +164,7 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig) -> TaskStat
 
     o_obj = np.asarray(obs["o_obj"], dtype=float)
     o_target = np.asarray(obs["o_target"], dtype=float)
+    o_obj_yaw = float(obs.get("o_obj_yaw", 0.0))
     contact = int(obs.get("o_contact", 0))
 
     stable_contact_counter = _update_contact_counter(state.stable_contact_counter, contact)
@@ -149,7 +178,8 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig) -> TaskStat
     # ------------------------------------------------------------
     if phase == Phase.ReachAbove:
         # Drive to pregrasp pose above object.
-        err = o_obj - cfg.pregrasp_obj_rel
+        o_obj_eval = _reach_descend_rel(o_obj, o_obj_yaw, cfg.use_object_local_xy_errors)
+        err = o_obj_eval - cfg.pregrasp_obj_rel
         xy_ok = _xy_norm(err) <= cfg.reach_xy_threshold
         z_ok = abs(float(err[2])) <= cfg.reach_z_threshold
         if reach_cooldown == 0 and xy_ok and z_ok:
@@ -168,10 +198,10 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig) -> TaskStat
     elif phase == Phase.Descend:
         # Guarded descend: stop on contact (with hysteresis) or when position reached.
         descend_contact_hold = (state.descend_contact_hold + 1) if contact == 1 else 0
-        err = o_obj - cfg.grasp_obj_rel
+        o_obj_eval = _reach_descend_rel(o_obj, o_obj_yaw, cfg.use_object_local_xy_errors)
+        err = o_obj_eval - cfg.grasp_obj_rel
         x_err = abs(float(err[0]))
         y_err = abs(float(err[1]))
-        xy_err = _xy_norm(err)
         z_err = abs(float(err[2]))
         xy_ok = (x_err <= cfg.descend_x_threshold and y_err <= cfg.descend_y_threshold)
         z_ok = z_err <= cfg.descend_z_threshold
@@ -299,7 +329,12 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig) -> TaskStat
         if ee_z >= cfg.transit_height - cfg.transit_z_threshold:
             return replace(state, phase=Phase.MoveToPlaceAbove, step_in_phase=0, reach_cooldown=reach_cooldown)
         if contact == 0:
-            return replace(state, phase=Phase.ReachAbove, step_in_phase=0, stable_contact_counter=0)
+            return replace(
+                state,
+                phase=Phase.ReachAbove,
+                step_in_phase=0,
+                stable_contact_counter=0,
+            )
 
     elif phase == Phase.MoveToPlaceAbove:
         # Navigate to preplace above target.
@@ -310,7 +345,12 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig) -> TaskStat
             return replace(state, phase=Phase.DescendToPlace, step_in_phase=0, reach_cooldown=reach_cooldown)
         # Drop detection -> restart.
         if contact == 0:
-            return replace(state, phase=Phase.ReachAbove, step_in_phase=0, stable_contact_counter=0)
+            return replace(
+                state,
+                phase=Phase.ReachAbove,
+                step_in_phase=0,
+                stable_contact_counter=0,
+            )
 
     elif phase == Phase.DescendToPlace:
         err = o_target - cfg.place_target_rel
@@ -319,7 +359,12 @@ def step_fsm(state: Optional[TaskState], obs: Dict, cfg: TaskConfig) -> TaskStat
         if (_norm(err) <= cfg.place_threshold) or (place_xy_ok and place_z_ok):
             return replace(state, phase=Phase.Open, step_in_phase=0, reach_cooldown=reach_cooldown)
         if contact == 0:
-            return replace(state, phase=Phase.ReachAbove, step_in_phase=0, stable_contact_counter=0)
+            return replace(
+                state,
+                phase=Phase.ReachAbove,
+                step_in_phase=0,
+                stable_contact_counter=0,
+            )
 
     elif phase == Phase.Open:
         if step_in_phase >= cfg.open_hold_steps:

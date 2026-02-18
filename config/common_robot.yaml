@@ -1,0 +1,30 @@
+run:
+  control_mode: active_inference # active_inference
+  log_every_steps: 100
+
+controller:
+  max_step: 0.03
+  min_height: 0.02
+  max_target_radius: 0.78 
+  ik_damping: 0.03
+  nullspace_gain: 0.15
+  nullspace_gain_grasp: 0.05
+  max_joint_step: 0.20
+  ee_tolerance: 0.0001
+  move_smoothing: 0.55
+  yaw_target: 3
+  yaw_weight: 0.25
+  yaw_weight_grasp: 1.0
+  enable_yaw_objective: true
+  yaw_axis: 1
+  enable_topdown_objective: true
+  topdown_weight: 0.60
+  topdown_weight_grasp: 1.20
+  tool_axis: 2
+  gripper_open_width: 0.060
+  gripper_close_width: 0.0
+  gripper_rate: 0.03
+  gripper_width_tol: 0.0015
+  gripper_speed_tol: 0.002
+  gripper_switch_cooldown_steps: 6
+  debug_every_steps: 100

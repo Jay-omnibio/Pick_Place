@@ -44,7 +44,7 @@ class EEController:
     def __init__(self, simulator, config):
         self.simulator = simulator
         if not isinstance(config, dict):
-            raise ValueError("EEController requires a config dict loaded from config/tuning_config.yaml.")
+            raise ValueError("EEController requires a config dict loaded from config/common_robot.yaml.")
         missing = sorted(self.REQUIRED_CONFIG_KEYS - set(config.keys()))
         if missing:
             raise ValueError(f"EEController config missing required keys: {missing}")
@@ -189,6 +189,8 @@ class EEController:
             return
 
         grip_cmd = int(action.get("grip", 0))
+        close_target_override = action.get("grip_close_target_width", None)
+        open_target_override = action.get("grip_open_target_width", None)
         # Per-step orientation (do not overwrite instance defaults).
         self._step_enable_yaw = action.get("enable_yaw_objective", self.enable_yaw_objective)
         self._step_yaw_target = self._interpret_yaw_target(action.get("yaw_target", self.yaw_target))
@@ -210,7 +212,11 @@ class EEController:
         else:
             move = action.get("move", [0.0, 0.0, 0.0])
         self._apply_move(move, grip_cmd=grip_cmd)
-        self._apply_grip(grip_cmd)
+        self._apply_grip(
+            grip_cmd,
+            close_target_override=close_target_override,
+            open_target_override=open_target_override,
+        )
         self.control_step += 1
         if self.debug_every_steps > 0 and self.control_step % self.debug_every_steps == 0:
             print(
@@ -328,7 +334,7 @@ class EEController:
         data.ctrl[self.arm_actuator_ids] = q_target
         mujoco.mj_forward(model, data)
 
-    def _apply_grip(self, grip_cmd):
+    def _apply_grip(self, grip_cmd, close_target_override=None, open_target_override=None):
         current_width = float(self.simulator.get_gripper_width())
         current_speed = float(abs(self.simulator.get_gripper_speed()))
 
@@ -350,14 +356,37 @@ class EEController:
         if self.gripper_switch_cooldown > 0:
             self.gripper_switch_cooldown -= 1
 
-        can_switch = (self.gripper_state == "READY") and (self.gripper_switch_cooldown == 0)
+        # Important: allow close -> open switch immediately, even when close is not
+        # "READY" (object can block full close, which otherwise deadlocks release).
+        can_switch = (self.gripper_switch_cooldown == 0) and (
+            (self.gripper_state == "READY")
+            or (requested_mode == "open" and self.gripper_mode == "close")
+        )
         if requested_mode is not None and requested_mode != self.gripper_mode and can_switch:
             self.gripper_mode = requested_mode
             self.gripper_switch_cooldown = self.gripper_switch_cooldown_steps
 
-        self.gripper_target_width = (
-            self.gripper_close_width if self.gripper_mode == "close" else self.gripper_open_width
-        )
+        close_target = self.gripper_close_width
+        if close_target_override is not None:
+            try:
+                close_target = float(close_target_override)
+            except (TypeError, ValueError):
+                close_target = self.gripper_close_width
+            if not np.isfinite(close_target):
+                close_target = self.gripper_close_width
+            close_target = float(np.clip(close_target, self.gripper_close_width, self.gripper_open_width))
+
+        open_target = self.gripper_open_width
+        if open_target_override is not None:
+            try:
+                open_target = float(open_target_override)
+            except (TypeError, ValueError):
+                open_target = self.gripper_open_width
+            if not np.isfinite(open_target):
+                open_target = self.gripper_open_width
+            open_target = float(np.clip(open_target, self.gripper_close_width, self.gripper_open_width))
+
+        self.gripper_target_width = close_target if self.gripper_mode == "close" else open_target
 
         diff = self.gripper_target_width - current_width
         if abs(diff) < self.gripper_rate:

@@ -11,6 +11,7 @@ from policies.scripted_pick_place import ScriptedPickPlacePolicy
 from tasks.pick_place_fsm import Phase, TaskConfig, step_fsm
 from inference_interface import infer_beliefs
 from inference.action_selection import select_action
+from agent.ai_behavior_tree import AIPickPlaceBehaviorTree
 
 
 class ActiveInferenceAgent:
@@ -38,6 +39,7 @@ class ActiveInferenceAgent:
         logs_dir="logs",
         task_cfg=None,
         policy_cfg=None,
+        active_inference_cfg=None,
     ):
         self.simulator = simulator
         self.sensor_backend = sensor_backend
@@ -48,13 +50,34 @@ class ActiveInferenceAgent:
         self.log_every_steps = max(1, int(log_every_steps))
         self.step_count = 0
         if task_cfg is None:
-            raise ValueError("task_cfg is required. Load it from config/tuning_config.yaml.")
+            raise ValueError("task_cfg is required. Load it from config/fsm_config.yaml.")
         if policy_cfg is None:
-            raise ValueError("policy_cfg is required. Load it from config/tuning_config.yaml.")
+            raise ValueError("policy_cfg is required. Load it from config/fsm_config.yaml.")
+        if self.control_mode == "active_inference" and active_inference_cfg is None:
+            raise ValueError(
+                "active_inference_cfg is required in active_inference mode. "
+                "Load it from config/active_inference_config.yaml."
+            )
         self.task_cfg = task_cfg
+        self.active_inference_cfg = dict(active_inference_cfg or {})
         self.task_state = None
         self.policy = ScriptedPickPlacePolicy(task_cfg=self.task_cfg, policy_cfg=policy_cfg)
         self.current_belief = None
+        self.ai_startup_settle_steps = max(0, int(os.getenv("AI_STARTUP_SETTLE_STEPS", "80")))
+        self.active_inference_params = (
+            self._build_active_inference_params() if self.control_mode == "active_inference" else {}
+        )
+        self.ai_bt = (
+            AIPickPlaceBehaviorTree(
+                max_retries=int(self.active_inference_params.get("max_retries", 3)),
+                reach_reentry_cooldown_steps=int(
+                    self.active_inference_params.get("reach_reentry_cooldown_steps", 20)
+                ),
+            )
+            if self.control_mode == "active_inference"
+            else None
+        )
+        self._ai_settle_logged = False
         self.prev_phase = None
         self.prev_contact = None
         self.prev_escape_active = 0
@@ -154,6 +177,45 @@ class ActiveInferenceAgent:
         yaw = math.atan2(siny_cosp, cosy_cosp)
         return roll, pitch, yaw
 
+    @staticmethod
+    def _quat_wxyz_to_yaw(quat_wxyz):
+        w, x, y, z = [float(v) for v in quat_wxyz]
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return float(math.atan2(siny_cosp, cosy_cosp))
+
+    @staticmethod
+    def _obj_rel_world_to_local(obj_rel_world, obj_yaw):
+        rel = np.asarray(obj_rel_world, dtype=float).copy()
+        c = float(np.cos(float(obj_yaw)))
+        s = float(np.sin(float(obj_yaw)))
+        x_w, y_w = float(rel[0]), float(rel[1])
+        # local = Rz(-yaw) * world
+        rel[0] = c * x_w + s * y_w
+        rel[1] = -s * x_w + c * y_w
+        return rel
+
+    def _obj_rel_for_reach_descend(self, obj_rel_world, obj_yaw):
+        rel = np.asarray(obj_rel_world, dtype=float)
+        if getattr(self.task_cfg, "use_object_local_xy_errors", True):
+            return self._obj_rel_world_to_local(rel, obj_yaw)
+        return rel.copy()
+
+    @staticmethod
+    def _obs_obj_yaw(observation):
+        raw = observation.get("o_obj_yaw", 0.0)
+        try:
+            yaw = float(np.asarray(raw, dtype=float).reshape(-1)[0])
+            if np.isfinite(yaw):
+                return yaw
+        except (TypeError, ValueError, IndexError):
+            pass
+        return 0.0
+
+    def _true_obj_yaw(self, sim_state):
+        quat = sim_state.get("obj_quat_wxyz", [1.0, 0.0, 0.0, 0.0])
+        return self._quat_wxyz_to_yaw(quat)
+
     def _phase_name(self):
         if self.control_mode == "active_inference":
             if self.current_belief is None:
@@ -161,30 +223,93 @@ class ActiveInferenceAgent:
             return str(self.current_belief.get("phase", "Reach"))
         return self.task_state.phase.value if self.task_state is not None else Phase.ReachAbove.value
 
+    def is_terminal(self):
+        if self.control_mode == "active_inference":
+            if self.current_belief is None:
+                return False
+            phase = str(self.current_belief.get("phase", "Reach"))
+            return phase in ("Done", "Failure")
+        if self.task_state is None:
+            return False
+        phase = Phase(self.task_state.phase)
+        return phase in (Phase.Done, Phase.Failure)
+
+    def terminal_phase(self):
+        if self.control_mode == "active_inference":
+            if self.current_belief is None:
+                return ""
+            return str(self.current_belief.get("phase", ""))
+        if self.task_state is None:
+            return ""
+        return Phase(self.task_state.phase).value
+
     def _get_references(self):
         if self.control_mode == "active_inference":
-            reach_ref = np.array([0.0, 0.0, -0.08], dtype=float)
-            return reach_ref, reach_ref
+            if "reach_obj_rel" not in self.active_inference_params:
+                raise KeyError("Missing active-inference config key: reach_obj_rel")
+            if "descend_obj_rel" not in self.active_inference_params:
+                raise KeyError("Missing active-inference config key: descend_obj_rel")
+            reach_ref = np.asarray(self.active_inference_params["reach_obj_rel"], dtype=float)
+            descend_ref = np.asarray(self.active_inference_params["descend_obj_rel"], dtype=float)
+            return reach_ref, descend_ref
         return self.task_cfg.pregrasp_obj_rel, self.task_cfg.grasp_obj_rel
+
+    def _build_active_inference_params(self):
+        """
+        Build strict active-inference params from active_inference_config.yaml and
+        controller values from common_robot.yaml.
+        """
+        out = dict(self.active_inference_cfg)
+        controller = getattr(self.actuator_backend, "controller", None)
+        if controller is None:
+            raise ValueError("Active-inference mode requires a controller instance.")
+
+        out.update(
+            {
+                "grip_open_target": float(controller.gripper_open_width),
+                "grip_close_target": float(controller.gripper_close_width),
+                "grip_ready_width_tol": float(controller.gripper_width_tol),
+                "grip_ready_speed_tol": float(controller.gripper_speed_tol),
+            }
+        )
+        return out
 
     def _collect_log_metrics(self, sim_state, observation):
         reach_ref, descend_ref = self._get_references()
         obj_rel = np.asarray(observation.get("o_obj", [0.0, 0.0, 0.0]), dtype=float)
         target_rel = np.asarray(observation.get("o_target", [0.0, 0.0, 0.0]), dtype=float)
+        if self.control_mode == "active_inference":
+            preplace_ref = np.asarray(
+                self.active_inference_params.get("preplace_target_rel", self.task_cfg.preplace_target_rel),
+                dtype=float,
+            )
+            place_ref = np.asarray(
+                self.active_inference_params.get("place_target_rel", self.task_cfg.place_target_rel),
+                dtype=float,
+            )
+        else:
+            preplace_ref = self.task_cfg.preplace_target_rel
+            place_ref = self.task_cfg.place_target_rel
+        obs_obj_yaw = self._obs_obj_yaw(observation)
         ee_pos = np.asarray(sim_state.get("ee_pos", [0.0, 0.0, 0.0]), dtype=float)
         obj_pos = np.asarray(sim_state.get("obj_pos", [0.0, 0.0, 0.0]), dtype=float)
         target_pos = np.asarray(sim_state.get("target_pos", [0.0, 0.0, 0.0]), dtype=float)
+        true_obj_yaw = self._true_obj_yaw(sim_state)
         true_obj_rel = obj_pos - ee_pos
         true_target_rel = target_pos - ee_pos
 
-        true_reach_err_vec = true_obj_rel - reach_ref
-        true_descend_err_vec = true_obj_rel - descend_ref
-        true_preplace_err_vec = true_target_rel - self.task_cfg.preplace_target_rel
-        true_place_err_vec = true_target_rel - self.task_cfg.place_target_rel
-        obs_reach_err_vec = obj_rel - reach_ref
-        obs_descend_err_vec = obj_rel - descend_ref
-        obs_preplace_err_vec = target_rel - self.task_cfg.preplace_target_rel
-        obs_place_err_vec = target_rel - self.task_cfg.place_target_rel
+        # Reach/Descend XY frame is configurable (object-local or legacy world-frame).
+        obj_rel_eval = self._obj_rel_for_reach_descend(obj_rel, obs_obj_yaw)
+        true_obj_rel_eval = self._obj_rel_for_reach_descend(true_obj_rel, true_obj_yaw)
+
+        true_reach_err_vec = true_obj_rel_eval - reach_ref
+        true_descend_err_vec = true_obj_rel_eval - descend_ref
+        true_preplace_err_vec = true_target_rel - preplace_ref
+        true_place_err_vec = true_target_rel - place_ref
+        obs_reach_err_vec = obj_rel_eval - reach_ref
+        obs_descend_err_vec = obj_rel_eval - descend_ref
+        obs_preplace_err_vec = target_rel - preplace_ref
+        obs_place_err_vec = target_rel - place_ref
 
         return {
             "obs_reach_x_error": float(abs(obs_reach_err_vec[0])),
@@ -238,6 +363,7 @@ class ActiveInferenceAgent:
             return None
         return self._compute_descend_gate(
             obj_rel=observation.get("o_obj", [0.0, 0.0, 0.0]),
+            obj_yaw=self._obs_obj_yaw(observation),
             step_in_phase=int(self.task_state.step_in_phase),
             descend_contact_hold=int(self.task_state.descend_contact_hold),
             descend_ready_counter=int(self.task_state.descend_ready_counter),
@@ -250,7 +376,23 @@ class ActiveInferenceAgent:
         m = self._collect_log_metrics(sim_state, observation)
         msg = f"[HB] step={self.step_count} phase={phase} contact={contact} grip={grip_cmd}"
 
-        if phase == Phase.ReachAbove.value:
+        if phase == "Reach" and self.control_mode == "active_inference" and self.current_belief is not None:
+            turn_sign = int(self.current_belief.get("reach_turn_sign", 0))
+            watchdog = int(self.current_belief.get("reach_watchdog_active", 0))
+            no_prog = int(self.current_belief.get("reach_no_progress_steps", 0))
+            best_err = float(self.current_belief.get("reach_best_error", float("nan")))
+            yaw_align = int(self.current_belief.get("reach_yaw_align_active", 0))
+            yaw_timer = int(self.current_belief.get("reach_yaw_align_timer", 0))
+            reach_thr = float(self.active_inference_params["approach_threshold"])
+            msg += (
+                f" x={m['true_reach_x_error']:.4f} "
+                f"y={m['true_reach_y_error']:.4f} "
+                f"xy={m['true_reach_xy_error']:.4f}/{reach_thr:.4f} "
+                f"z={m['true_reach_z_error']:.4f}/{reach_thr:.4f} "
+                f"turn={turn_sign:+d} wd={watchdog} stall={no_prog} "
+                f"best={best_err:.4f} yaw_align={yaw_align}:{yaw_timer}"
+            )
+        elif phase == Phase.ReachAbove.value:
             msg += (
                 f" x={m['true_reach_x_error']:.4f} "
                 f"y={m['true_reach_y_error']:.4f} "
@@ -290,25 +432,73 @@ class ActiveInferenceAgent:
                 f"ee_z={m['true_ee_z']:.4f} obj_z={m['true_obj_z']:.4f}"
             )
         elif phase == Phase.Transit.value:
-            msg += f" ee_z={m['true_ee_z']:.4f} transit_target_z={self.task_cfg.transit_height:.4f}"
+            transit_target = (
+                float(self.active_inference_params.get("transit_height", self.task_cfg.transit_height))
+                if self.control_mode == "active_inference"
+                else self.task_cfg.transit_height
+            )
+            msg += f" ee_z={m['true_ee_z']:.4f} transit_target_z={transit_target:.4f}"
         elif phase == Phase.MoveToPlaceAbove.value:
+            pre_xy_thr = (
+                float(self.active_inference_params.get("preplace_xy_threshold", self.task_cfg.preplace_xy_threshold))
+                if self.control_mode == "active_inference"
+                else self.task_cfg.preplace_xy_threshold
+            )
+            pre_z_thr = (
+                float(self.active_inference_params.get("preplace_z_threshold", self.task_cfg.preplace_z_threshold))
+                if self.control_mode == "active_inference"
+                else self.task_cfg.preplace_z_threshold
+            )
+            pre_thr = (
+                float(self.active_inference_params.get("preplace_threshold", self.task_cfg.preplace_threshold))
+                if self.control_mode == "active_inference"
+                else self.task_cfg.preplace_threshold
+            )
             msg += (
                 f" x={m['true_preplace_x_error']:.4f} "
                 f"y={m['true_preplace_y_error']:.4f} "
-                f"xy={m['true_preplace_xy_error']:.4f}/{self.task_cfg.preplace_xy_threshold:.4f} "
-                f"z={m['true_preplace_z_error']:.4f}/{self.task_cfg.preplace_z_threshold:.4f} "
-                f"norm={m['obs_preplace_error']:.4f}/{self.task_cfg.preplace_threshold:.4f} "
+                f"xy={m['true_preplace_xy_error']:.4f}/{pre_xy_thr:.4f} "
+                f"z={m['true_preplace_z_error']:.4f}/{pre_z_thr:.4f} "
+                f"norm={m['obs_preplace_error']:.4f}/{pre_thr:.4f} "
                 f"ee_z={m['true_ee_z']:.4f}"
             )
         elif phase == Phase.DescendToPlace.value:
+            place_xy_thr = (
+                float(self.active_inference_params.get("place_xy_threshold", self.task_cfg.place_xy_threshold))
+                if self.control_mode == "active_inference"
+                else self.task_cfg.place_xy_threshold
+            )
+            place_z_thr = (
+                float(self.active_inference_params.get("place_z_threshold", self.task_cfg.place_z_threshold))
+                if self.control_mode == "active_inference"
+                else self.task_cfg.place_z_threshold
+            )
+            place_thr = (
+                float(self.active_inference_params.get("place_threshold", self.task_cfg.place_threshold))
+                if self.control_mode == "active_inference"
+                else self.task_cfg.place_threshold
+            )
             msg += (
                 f" x={m['true_place_x_error']:.4f} "
                 f"y={m['true_place_y_error']:.4f} "
-                f"xy={m['true_place_xy_error']:.4f}/{self.task_cfg.place_xy_threshold:.4f} "
-                f"z={m['true_place_z_error']:.4f}/{self.task_cfg.place_z_threshold:.4f} "
-                f"norm={m['obs_place_error']:.4f}/{self.task_cfg.place_threshold:.4f} "
+                f"xy={m['true_place_xy_error']:.4f}/{place_xy_thr:.4f} "
+                f"z={m['true_place_z_error']:.4f}/{place_z_thr:.4f} "
+                f"norm={m['obs_place_error']:.4f}/{place_thr:.4f} "
                 f"ee_z={m['true_ee_z']:.4f} obj_z={m['true_obj_z']:.4f}"
             )
+        elif self.control_mode == "active_inference" and phase == "Open" and self.current_belief is not None:
+            open_timer = int(self.current_belief.get("open_timer", 0))
+            open_steps = int(self.active_inference_params.get("open_hold_steps", 0))
+            msg += (
+                f" open_step={open_timer}/{open_steps} "
+                f"x={m['true_place_x_error']:.4f} y={m['true_place_y_error']:.4f} z={m['true_place_z_error']:.4f}"
+            )
+        elif self.control_mode == "active_inference" and phase == "Retreat" and self.current_belief is not None:
+            retreat_timer = int(self.current_belief.get("retreat_timer", 0))
+            retreat_steps = int(self.active_inference_params.get("retreat_steps", 0))
+            msg += f" retreat_step={retreat_timer}/{retreat_steps}"
+        elif self.control_mode == "active_inference" and phase == "Done":
+            msg += " status=done"
         elif phase == Phase.Open.value and self.task_state is not None:
             msg += (
                 f" open_step={int(self.task_state.step_in_phase)}/{self.task_cfg.open_hold_steps} "
@@ -337,18 +527,14 @@ class ActiveInferenceAgent:
     def _log_step(self, sim_state, observation, action):
         ee = np.asarray(observation["o_ee"], dtype=float)
         obj_rel = np.asarray(observation["o_obj"], dtype=float)
+        obj_rel_eval = self._obj_rel_for_reach_descend(obj_rel, self._obs_obj_yaw(observation))
         target_rel = np.asarray(observation["o_target"], dtype=float)
-        if self.control_mode == "active_inference":
-            pregrasp_ref = np.array([0.0, 0.0, -0.08], dtype=float)
-            descend_ref = pregrasp_ref
-        else:
-            pregrasp_ref = self.task_cfg.pregrasp_obj_rel
-            descend_ref = self.task_cfg.grasp_obj_rel
-        pregrasp_error = float(np.linalg.norm(obj_rel - pregrasp_ref))
-        descend_error = float(np.linalg.norm(obj_rel - descend_ref))
-        descend_x_error = float(abs((obj_rel - descend_ref)[0]))
-        descend_y_error = float(abs((obj_rel - descend_ref)[1]))
-        descend_z_error = float(abs((obj_rel - descend_ref)[2]))
+        pregrasp_ref, descend_ref = self._get_references()
+        pregrasp_error = float(np.linalg.norm(obj_rel_eval - pregrasp_ref))
+        descend_error = float(np.linalg.norm(obj_rel_eval - descend_ref))
+        descend_x_error = float(abs((obj_rel_eval - descend_ref)[0]))
+        descend_y_error = float(abs((obj_rel_eval - descend_ref)[1]))
+        descend_z_error = float(abs((obj_rel_eval - descend_ref)[2]))
         if "ee_target_pos" in action:
             move = np.asarray(action["ee_target_pos"], dtype=float) - np.asarray(sim_state["ee_pos"], dtype=float)
         else:
@@ -458,12 +644,10 @@ class ActiveInferenceAgent:
         displacement = float(np.linalg.norm(ee_end - ee_start))
         # Use current observation (object relative) to decide if we are making progress.
         obj_rel = np.asarray(self.obs_history[-1].get("o_obj", [0.0, 0.0, 0.0]), dtype=float)
-        reach_ref = (
-            np.array([0.0, 0.0, -0.08], dtype=float)
-            if self.control_mode == "active_inference"
-            else self.task_cfg.pregrasp_obj_rel
-        )
-        reach_error = float(np.linalg.norm(obj_rel - reach_ref))
+        obj_yaw = self._obs_obj_yaw(self.obs_history[-1])
+        obj_rel_eval = self._obj_rel_for_reach_descend(obj_rel, obj_yaw)
+        reach_ref, _ = self._get_references()
+        reach_error = float(np.linalg.norm(obj_rel_eval - reach_ref))
 
         if displacement >= self.stall_disp_threshold or reach_error < 0.10:
             return action
@@ -483,13 +667,14 @@ class ActiveInferenceAgent:
         print(f"[Escape] stall detected at step {self.step_count}: displacement={displacement:.5f}, reach_error={reach_error:.5f}")
         return {"move": escape_move.tolist(), "grip": 0}
 
-    def _compute_descend_gate(self, obj_rel, step_in_phase, descend_contact_hold, descend_ready_counter):
+    def _compute_descend_gate(self, obj_rel, obj_yaw, step_in_phase, descend_contact_hold, descend_ready_counter):
         """
         Compute descend trigger/gate status using the same conditions as step_fsm.
         This is used only for explainability logs.
         """
         obj_rel = np.asarray(obj_rel, dtype=float)
-        err = obj_rel - self.task_cfg.grasp_obj_rel
+        obj_rel_eval = self._obj_rel_for_reach_descend(obj_rel, float(obj_yaw))
+        err = obj_rel_eval - self.task_cfg.grasp_obj_rel
         x_err = float(abs(err[0]))
         y_err = float(abs(err[1]))
         z_err = float(abs(err[2]))
@@ -557,8 +742,10 @@ class ActiveInferenceAgent:
         matching the exact update order used by step_fsm.
         """
         obj_rel = np.asarray(observation.get("o_obj", [0.0, 0.0, 0.0]), dtype=float)
+        obj_yaw = self._obs_obj_yaw(observation)
+        obj_rel_eval = self._obj_rel_for_reach_descend(obj_rel, obj_yaw)
         contact = int(observation.get("o_contact", 0))
-        err = obj_rel - self.task_cfg.grasp_obj_rel
+        err = obj_rel_eval - self.task_cfg.grasp_obj_rel
         xy_ok = (
             abs(float(err[0])) <= self.task_cfg.descend_x_threshold
             and abs(float(err[1])) <= self.task_cfg.descend_y_threshold
@@ -568,6 +755,7 @@ class ActiveInferenceAgent:
         descend_ready_counter = (int(prev_state.descend_ready_counter) + 1) if (xy_ok and z_ok) else 0
         return self._compute_descend_gate(
             obj_rel=obj_rel,
+            obj_yaw=obj_yaw,
             step_in_phase=int(prev_state.step_in_phase) + 1,
             descend_contact_hold=descend_contact_hold,
             descend_ready_counter=descend_ready_counter,
@@ -580,8 +768,23 @@ class ActiveInferenceAgent:
         self.obs_history.append(observation)
 
         if self.control_mode == "active_inference":
-            self.current_belief = infer_beliefs(observation=observation, previous_belief=self.current_belief)
-            action = select_action(self.current_belief)
+            if self.step_count < self.ai_startup_settle_steps:
+                if not self._ai_settle_logged:
+                    print(f"[AI] startup_settle_steps={self.ai_startup_settle_steps} (holding EE while object settles)")
+                    self._ai_settle_logged = True
+                action = {
+                    "move": [0.0, 0.0, 0.0],
+                    "grip": -1,
+                    "enable_yaw_objective": False,
+                    "enable_topdown_objective": True,
+                }
+            else:
+                self.current_belief = infer_beliefs(
+                    observation=observation,
+                    previous_belief=self.current_belief,
+                    params=self.active_inference_params,
+                )
+                action = select_action(self.current_belief, params=self.active_inference_params)
         else:
             prev_task_state = self.task_state
             descend_gate = None
@@ -633,10 +836,12 @@ class ActiveInferenceAgent:
         ee_pos = np.asarray(sim_state.get("ee_pos", [0.0, 0.0, 0.0]), dtype=float)
         obj_pos = np.asarray(sim_state.get("obj_pos", [0.0, 0.0, 0.0]), dtype=float)
         obj_rel = obj_pos - ee_pos
-        descend_ref = self.task_cfg.grasp_obj_rel if self.control_mode != "active_inference" else np.array([0.0, 0.0, -0.08], dtype=float)
-        descend_x_error = float(abs((obj_rel - descend_ref)[0]))
-        descend_y_error = float(abs((obj_rel - descend_ref)[1]))
-        descend_z_error = float(abs((obj_rel - descend_ref)[2]))
+        obj_yaw = self._true_obj_yaw(sim_state)
+        obj_rel_eval = self._obj_rel_for_reach_descend(obj_rel, obj_yaw)
+        _, descend_ref = self._get_references()
+        descend_x_error = float(abs((obj_rel_eval - descend_ref)[0]))
+        descend_y_error = float(abs((obj_rel_eval - descend_ref)[1]))
+        descend_z_error = float(abs((obj_rel_eval - descend_ref)[2]))
         phase = (
             self.current_belief.get("phase", "Reach")
             if self.control_mode == "active_inference" and self.current_belief is not None

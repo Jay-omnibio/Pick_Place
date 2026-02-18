@@ -1,7 +1,7 @@
 # ----------------------------------------
 # Safety layer (workspace, velocity, timeouts)
 # ----------------------------------------
-workspace_min: [0.05, -0.50, 0.005]
-workspace_max: [0.85, 0.50, 0.95]
-max_move_norm: 0.05
-max_ee_target_radius: 0.85
+workspace_min: [-1, -1, 0.009]
+workspace_max: [1, 1, 0.95] # EE target clamping box for safety (in world frame, relative to robot base). Note: Z max should be below any sim ceiling to avoid issues.
+max_move_norm: 0.05 # Max allowed EE movement norm per control step (safety clamping).
+max_ee_target_radius: 100 # Max allowed radius for EE target from origin (safety clamping). # 100 mean no clamping
