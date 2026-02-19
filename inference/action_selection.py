@@ -204,6 +204,10 @@ def _select_action_python(current_belief, params=None):
     preplace_xy_threshold = float(_require_param(params, "preplace_xy_threshold"))
     place_xy_threshold = float(_require_param(params, "place_xy_threshold"))
     place_z_threshold = float(_require_param(params, "place_z_threshold"))
+    confidence_speed_scaling_enabled = bool(_require_param(params, "confidence_speed_scaling_enabled"))
+    confidence_speed_min_scale = float(_require_param(params, "confidence_speed_min_scale"))
+    reach_confidence_speed_power = float(_require_param(params, "reach_confidence_speed_power"))
+    descend_confidence_speed_power = float(_require_param(params, "descend_confidence_speed_power"))
 
     cfg_reach_obj_rel = _require_vec3(params, "reach_obj_rel")
     cfg_align_obj_rel = _require_vec3(params, "align_obj_rel")
@@ -242,6 +246,16 @@ def _select_action_python(current_belief, params=None):
     candidate_actions.append({"move": [0.0, 0.0, 0.0], "grip": -1})  # open
     
     phase = current_belief.get("phase", "Reach")
+    obs_conf = float(current_belief.get("obs_confidence", 1.0))
+    if not np.isfinite(obs_conf):
+        obs_conf = 1.0
+    obs_conf = float(np.clip(obs_conf, 0.0, 1.0))
+
+    def _phase_conf_scale(power):
+        if not confidence_speed_scaling_enabled:
+            return 1.0
+        return float(max(confidence_speed_min_scale, obs_conf ** float(power)))
+
     reach_obj_rel = np.array(current_belief.get("reach_obj_rel", cfg_reach_obj_rel), dtype=float)
     align_obj_rel = np.array(
         current_belief.get("align_obj_rel", cfg_align_obj_rel),
@@ -331,20 +345,21 @@ def _select_action_python(current_belief, params=None):
                 desired_xy = target_xy - ee_xy
 
         # Watchdog fallback: disable arc and push a little stronger linear correction.
-        step_floor = reach_step_min
+        reach_conf_scale = _phase_conf_scale(reach_confidence_speed_power)
+        step_floor = reach_step_min * reach_conf_scale
         if reach_watchdog_active:
             desired_xy = np.array([err[0], err[1]], dtype=float)
             # Critical: when arc stalls, force non-zero Z coupling so we can escape
             # XY-only deadlocks near kinematic limits.
             z_weight = max(z_weight, 0.35)
-            step_floor = max(step_floor, 0.012)
+            step_floor = max(step_floor, 0.012 * reach_conf_scale)
 
         desired_move = np.array([desired_xy[0], desired_xy[1], z_weight * err[2]], dtype=float)
         desired_norm = float(np.linalg.norm(desired_move))
         if desired_norm > 0.0:
             # Dynamic step: larger when far, but never tiny-stuck near saturation.
             err_norm = float(np.linalg.norm(err))
-            step_limit = float(np.clip(0.35 * err_norm, step_floor, reach_delta))
+            step_limit = float(np.clip(0.35 * err_norm, step_floor, reach_delta * reach_conf_scale))
             if desired_norm > step_limit:
                 desired_move = (desired_move / desired_norm) * step_limit
         return {
@@ -435,8 +450,10 @@ def _select_action_python(current_belief, params=None):
 
         desired = np.array([w_x * err[0], w_y * err[1], z_weight * err[2]], dtype=float)
         n = np.linalg.norm(desired)
-        if n > grasp_step and n > 0:
-            desired = (desired / n) * grasp_step
+        descend_conf_scale = _phase_conf_scale(descend_confidence_speed_power)
+        descend_step_cap = max(1e-6, grasp_step * descend_conf_scale)
+        if n > descend_step_cap and n > 0:
+            desired = (desired / n) * descend_step_cap
         yaw_enable = not (x_out or y_out)
         return {
             "move": desired.tolist(),

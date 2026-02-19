@@ -1,0 +1,20 @@
+sequenceDiagram
+    participant R as run_pick_place.py
+    participant A as agent/agent_loop.py
+    participant S as backends/sensor_backend.py
+    participant M as env/simulator.py
+    participant X as backends/actuator_backend.py
+    participant C as control/controller.py
+    participant K as safety/safety_checker.py
+
+    R->>A: step()
+    A->>M: get_state()
+    A->>S: get_observation(sim_state)
+    A->>A: mode branch (FSM or AI)
+    A->>A: logging/events/heartbeat/CSV
+    A->>X: apply_action(action)
+    X->>K: check(action, current_ee)
+    K-->>X: safe action (or None)
+    X->>C: apply_action(action)
+    C->>M: set_ee_position / IK + gripper command
+    R->>M: step()

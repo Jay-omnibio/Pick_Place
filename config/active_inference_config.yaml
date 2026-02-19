@@ -2,7 +2,7 @@ inference:
   # ---------- Object-relative targets ----------
   # Format: [x, y, z] in meters, relative to EE->object frame used by observation.
   reach_obj_rel: [-0.02, 0.00, -0.06]          # Reach target above object.
-  align_obj_rel: [-0.02, 0.0, -0.06]          # Align target before descend.
+  align_obj_rel: [-0.02, 0.00, -0.06]          # Align target before descend.
   descend_obj_rel: [-0.01, 0.0, 0.02]        # Descend/grasp target near object top.
 
   # ---------- Phase gates ----------
@@ -45,7 +45,7 @@ inference:
 
   # ---------- Belief smoothing / reacquire ----------
   alpha_ee: 0.7                             # EE observation smoothing gain.
-  alpha_obj_default: 0.7                    # Object smoothing gain (non-Reach phases).
+  alpha_obj_default: 0.4  # 0.7 changed                   # Object smoothing gain (non-Reach phases).
   alpha_obj_reach: 0.9                      # Object smoothing gain (Reach phase).
   alpha_target: 0.8                         # Target smoothing gain.
   obj_reacquire_jump: 0.05                  # If object jump > this, trust current obs more.
@@ -54,11 +54,39 @@ inference:
   contact_on_count: 2                       # Contact debounce to latch grasp=1.
   contact_off_count: 2                      # Contact debounce to unlatch grasp=0.
 
+  # ---------- Observation confidence / transition gating ----------
+  confidence_enabled: true                 # Gate key phase transitions on observation confidence.
+  confidence_alpha: 0.25                    # Smoothing for confidence score.
+  confidence_min_for_phase_change: 0.35 #0.35 changed     # Minimum confidence required for phase-change gates.
+  obj_jump_confidence_scale: 0.10           # Larger object jump lowers confidence.
+  target_jump_confidence_scale: 0.12        # Larger target jump lowers confidence.
+  contact_flip_confidence_penalty: 0.10     # Penalty when contact flips rapidly.
+  allow_bt_prior_override: true             # If true, belief target refs can override config refs (BT prior-node style).
+  bt_set_priors_enabled: true               # Enable BT SetPrior leaf behavior (phase-aware prior assignment).
+  bt_retry_reach_z_step: 0.005              # Extra reach/align height per retry (object-relative Z, meters).
+  bt_retry_reach_z_max: 0.020               # Cap for retry-based reach/align extra height.
+
+  # ---------- VFE metrics and optional transition gating ----------
+  vfe_enabled: true                         # Compute per-step VFE metrics for logs/BT supervision.
+  vfe_epistemic_weight: 0.10                # Weight on covariance trace in VFE.
+  vfe_phase_change_enabled: false           # If true, require VFE <= vfe_phase_change_max for phase transitions.
+  vfe_phase_change_max: 0.20                # Max VFE allowed for phase transition when enabled.
+  vfe_recover_enabled: true                 # Allow BT to request recovery when VFE stays high.
+  vfe_recover_threshold: 1.50               # High-VFE threshold for BT recovery trigger.
+  vfe_recover_steps: 50                     # Consecutive high-VFE steps before BT recovery.
+  release_contact_warn_steps: 20            # During Open, warn if contact persists this many steps.
+
+  # ---------- Risk detection (detect-only, no forced recovery) ----------
+  risk_detection_enabled: true              # Enable singularity/collision-like risk flags in logs.
+  singularity_dq_ratio_threshold: 5.0       # dq_raw/dq_applied ratio threshold for singularity risk.
+  singularity_no_progress_steps: 30         # Consecutive steps before singularity warning.
+  unintended_contact_warn_steps: 12         # Consecutive unexpected-contact steps before warning.
+
   # ---------- Reach watchdog / arc / yaw-align ----------
   reach_arc_angle_trigger_deg: 50.0         # Start turn lock when angular gap exceeds this.
   reach_arc_release_deg: 20.0               # Release turn lock when angular gap drops below this.
   reach_progress_eps: 0.002                 # Reach improvement epsilon for stall tracking.
-  reach_stall_steps: 90                     # No-progress steps before watchdog fallback.
+  reach_stall_steps: 300                     # No-progress steps before watchdog fallback.
   reach_yaw_align_xy_enter: 0.20            # Enter yaw-align hold when XY error < this.
   reach_yaw_align_steps: 100                # Number of yaw-align hold steps.
   grip_close_ready_max_width: 0.035         # Width threshold to consider close-ready with contact.
@@ -70,8 +98,8 @@ inference:
   place_threshold: 0.03                     # Norm threshold for DescendToPlace completion.
   preplace_xy_threshold: 0.02               # XY threshold for MoveToPlaceAbove.
   preplace_z_threshold: 0.03                # Z threshold for MoveToPlaceAbove.
-  place_xy_threshold: 0.02                  # XY threshold for DescendToPlace.
-  place_z_threshold: 0.01                   # Z threshold for DescendToPlace.
+  place_xy_threshold: 0.025                  # XY threshold for DescendToPlace.
+  place_z_threshold: 0.015                   # Z threshold for DescendToPlace.
   transit_height: 0.35                      # Safe height before moving to place.
   transit_z_threshold: 0.02                 # Transit completion tolerance on Z.
   open_hold_steps: 80                       # Hold-open duration before retreat.
@@ -80,7 +108,7 @@ inference:
 
 action_selection:
   # ---------- Expected Free Energy / prediction ----------
-  lambda_epistemic: 0.1                     # Epistemic weight in EFE.
+  lambda_epistemic: 0.25  # 0.1 changed                   # Epistemic weight in EFE.
   delta: 0.022                              # Generic step for fallback EFE scan.
   reach_delta: 0.026                        # Max cartesian step in Reach.
   action_effectiveness: 0.4                 # Belief dynamics coupling factor.
@@ -89,7 +117,7 @@ action_selection:
   reach_axis_threshold_x: 0.03              # X normalization for Reach axis-priority.
   reach_axis_threshold_y: 0.03              # Y normalization for Reach axis-priority.
   reach_z_blend_start: 0.06                 # Start adding Z when XY max error drops below this.
-  reach_z_blend_full: 0.02                  # Full Z when XY max error drops below this.
+  reach_z_blend_full: 0.005  #0.02 changed               # Full Z when XY max error drops below this.
   reach_step_min: 0.008                     # Reach minimum step floor.
 
   # ---------- Reach arc/spiral ----------
@@ -103,3 +131,7 @@ action_selection:
   grasp_step: 0.010                         # Max step in Descend/grasp approach.
   align_step: 0.012                         # Max step in Align.
   pregrasp_hold_step: 0.006                 # Max correction step in PreGraspHold.
+  confidence_speed_scaling_enabled: true    # Scale Reach/Descend step size by observation confidence.
+  confidence_speed_min_scale: 0.40          # Minimum speed scale when confidence is low.
+  reach_confidence_speed_power: 1.0         # Reach scale uses confidence^power.
+  descend_confidence_speed_power: 1.5       # Descend scale uses confidence^power (higher => more cautious).

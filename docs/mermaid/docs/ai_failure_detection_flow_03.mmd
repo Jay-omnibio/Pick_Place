@@ -1,0 +1,15 @@
+flowchart TD
+    A[controller debug norms] --> B[dq_ratio = dq_raw / dq_applied]
+    C[phase error progress] --> D[phase_no_progress_steps]
+    B --> E{dq_ratio high AND no progress}
+    D --> E
+    E -->|yes| F[singularity_counter++]
+    E -->|no| G[counter reset]
+    F --> H{counter >= singularity_no_progress_steps}
+    H -->|yes| I[singularity_warn=1]
+
+    J[current phase + contact] --> K[unexpected_contact?]
+    K -->|yes| L[unintended_contact_counter++]
+    K -->|no| M[counter reset]
+    L --> N{counter >= unintended_contact_warn_steps}
+    N -->|yes| O[unintended_contact_warn=1]

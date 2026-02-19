@@ -37,3 +37,13 @@ observation_filter:
   outlier_max_jump_target: 0.15
   outlier_max_jump_ee: 0.08
   latency_steps: 0        # 0 = no delay (use 2-5 for real camera)
+
+# ----------------------------------------
+# State estimator (position + velocity)
+# ----------------------------------------
+state_estimator:
+  enabled: true
+  alpha: 0.65             # Position correction gain.
+  beta: 0.08              # Velocity correction gain.
+  min_dt: 0.001           # Lower clamp for dt seconds.
+  max_dt: 0.2             # Upper clamp for dt seconds.

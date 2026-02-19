@@ -122,8 +122,18 @@ function select_action(current_belief, params)
     preplace_xy_threshold = Float64(_require(params, :preplace_xy_threshold))
     place_xy_threshold = Float64(_require(params, :place_xy_threshold))
     place_z_threshold = Float64(_require(params, :place_z_threshold))
+    confidence_speed_scaling_enabled = Bool(_require(params, :confidence_speed_scaling_enabled))
+    confidence_speed_min_scale = Float64(_require(params, :confidence_speed_min_scale))
+    reach_confidence_speed_power = Float64(_require(params, :reach_confidence_speed_power))
+    descend_confidence_speed_power = Float64(_require(params, :descend_confidence_speed_power))
 
     phase = current_belief[:phase]
+    obs_conf = Float64(get(current_belief, :obs_confidence, 1.0))
+    if !isfinite(obs_conf)
+        obs_conf = 1.0
+    end
+    obs_conf = clamp(obs_conf, 0.0, 1.0)
+    _phase_conf_scale(power::Float64) = confidence_speed_scaling_enabled ? max(confidence_speed_min_scale, obs_conf^power) : 1.0
     reach_obj_rel = haskey(current_belief, :reach_obj_rel) ? Float64.(current_belief[:reach_obj_rel]) : _require_vec3(params, :reach_obj_rel)
     align_obj_rel = haskey(current_belief, :align_obj_rel) ? Float64.(current_belief[:align_obj_rel]) : _require_vec3(params, :align_obj_rel)
     descend_obj_rel = haskey(current_belief, :descend_obj_rel) ? Float64.(current_belief[:descend_obj_rel]) : _require_vec3(params, :descend_obj_rel)
@@ -193,18 +203,19 @@ function select_action(current_belief, params)
             end
         end
 
-        step_floor = reach_step_min
+        reach_conf_scale = _phase_conf_scale(reach_confidence_speed_power)
+        step_floor = reach_step_min * reach_conf_scale
         if reach_watchdog_active
             desired_xy = [err[1], err[2]]
             z_weight = max(z_weight, 0.35)
-            step_floor = max(step_floor, 0.012)
+            step_floor = max(step_floor, 0.012 * reach_conf_scale)
         end
 
         desired_move = [desired_xy[1], desired_xy[2], z_weight * err[3]]
         desired_norm = norm(desired_move)
         if desired_norm > 0.0
             err_norm = norm(err)
-            step_limit = clamp(0.35 * err_norm, step_floor, reach_delta)
+            step_limit = clamp(0.35 * err_norm, step_floor, reach_delta * reach_conf_scale)
             if desired_norm > step_limit
                 desired_move = (desired_move / desired_norm) * step_limit
             end
@@ -296,8 +307,10 @@ function select_action(current_belief, params)
 
         desired = [w_x * err[1], w_y * err[2], z_weight * err[3]]
         n = norm(desired)
-        if n > grasp_step && n > 0.0
-            desired = (desired / n) * grasp_step
+        descend_conf_scale = _phase_conf_scale(descend_confidence_speed_power)
+        descend_step_cap = max(1e-6, grasp_step * descend_conf_scale)
+        if n > descend_step_cap && n > 0.0
+            desired = (desired / n) * descend_step_cap
         end
         yaw_enable = !(x_out || y_out)
         return (

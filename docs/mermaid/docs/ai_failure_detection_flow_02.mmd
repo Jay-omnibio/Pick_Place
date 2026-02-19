@@ -1,0 +1,13 @@
+flowchart TD
+    A[New observation] --> B[obj jump, target jump, contact flip]
+    B --> C[raw confidence score]
+    C --> D[EMA smoothing -> obs_confidence]
+    D --> E{obs_confidence >= confidence_min_for_phase_change}
+    E -->|yes| F[allow phase transition gates]
+    E -->|no| G[hold current phase]
+
+    O[phase == Open] --> O1{contact == 1}
+    O1 -->|yes| O2[release_contact_counter++]
+    O1 -->|no| O3[counter reset to 0]
+    O2 --> O4{counter >= release_contact_warn_steps}
+    O4 -->|yes| O5[release_warning = 1]

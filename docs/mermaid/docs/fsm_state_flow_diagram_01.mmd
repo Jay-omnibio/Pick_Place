@@ -1,0 +1,30 @@
+stateDiagram-v2
+    [*] --> ReachAbove
+
+    ReachAbove --> Descend: reach_cooldown==0\nand XY within reach_xy_threshold\nand Z within reach_z_threshold
+
+    Descend --> Close: position_ok OR contact_stop OR timeout_stop
+    Descend --> Descend: otherwise
+
+    Close --> LiftTest: step_in_phase >= close_hold_steps\nand stable_contact_counter >= stable_contact_steps
+    Close --> ReachAbove: close timeout\n(retry_count <= max_retries)
+    Close --> Failure: close timeout\n(retry_count > max_retries)
+
+    LiftTest --> Transit: lift_test_timer >= lift_test_steps\nand contact==1\nand drift <= lift_test_obj_rel_drift_max
+    LiftTest --> ReachAbove: contact lost OR drift too high\n(retry_count <= max_retries)
+    LiftTest --> Failure: contact lost OR drift too high\n(retry_count > max_retries)
+
+    Transit --> MoveToPlaceAbove: ee_z >= transit_height - transit_z_threshold
+    Transit --> ReachAbove: contact==0
+
+    MoveToPlaceAbove --> DescendToPlace: ||o_target - preplace_target_rel|| <= preplace_threshold
+    MoveToPlaceAbove --> ReachAbove: contact==0
+
+    DescendToPlace --> Open: ||o_target - place_target_rel|| <= place_threshold
+    DescendToPlace --> ReachAbove: contact==0
+
+    Open --> Retreat: step_in_phase >= open_hold_steps
+    Retreat --> Done: step_in_phase >= retreat_steps
+
+    Done --> Done
+    Failure --> Failure

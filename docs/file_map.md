@@ -27,6 +27,7 @@ This is a quick reference for what each important file is used for.
 | `backends/sensor_backend.py` | Sensor backend abstraction (sim path currently). |
 | `backends/actuator_backend.py` | Actuator backend abstraction (sim path currently). |
 | `perception/observation_filter.py` | Optional observation filtering (smoothing/robustness). |
+| `state/state_estimator.py` | Lightweight alpha-beta state estimator for position+velocity (`o_*_est`, `o_*_vel`, `o_dt`). |
 
 ## Config (Split Runtime Configs)
 
@@ -60,6 +61,7 @@ This is a quick reference for what each important file is used for.
 | File | Use |
 |---|---|
 | `tools/plot_run_metrics.py` | Converts run CSV logs into plots for analysis. |
+| `tools/extract_mermaid_from_md.py` | Extracts Mermaid code blocks from Markdown into standalone `.mmd` files. |
 | `logs/run_*.csv` | Runtime outputs (phase, errors, action, true states). |
 | `logs/plots/run_*/` | Generated figures from log plotting tool. |
 
@@ -73,6 +75,9 @@ This is a quick reference for what each important file is used for.
 | `docs/config_audit_notes.md` | Notes on config constants and cleanup/audit findings. |
 | `docs/fsm_state_flow_diagram.md` | Diagram/version of FSM flow. |
 | `docs/active_inference_readiness_checklist.md` | Checklist before switching to active inference mode. |
+| `docs/runtime_system_flow.md` | End-to-end runtime architecture diagrams (startup, step loop, mode branches, file call path). |
+| `docs/ai_failure_detection_flow.md` | Active-inference detect-only failure monitoring diagrams (confidence/release/risk warnings). |
+| `docs/mermaid/` | Auto-generated Mermaid `.mmd` files extracted from Markdown docs. |
 | `docs/not_needed_inprovment.md` | Deferred improvements (non-blocking now). |
 | `docs/project_roadmap.md` | Roadmap level planning. |
 | `docs/real_world_grasp_transition_plan.md` | Transition plan from sim behavior to real-world grasping constraints. |

@@ -1,6 +1,7 @@
 import mujoco
 import mujoco.viewer
 import numpy as np
+from pathlib import Path
 
 
 class MujocoSimulator:
@@ -13,12 +14,36 @@ class MujocoSimulator:
     - expose limited, clean API
     """
 
-    def __init__(self, model_path, render=True):
+    def __init__(
+        self,
+        model_path,
+        render=True,
+        record_path=None,
+        record_fps=25,
+        record_width=960,
+        record_height=540,
+        record_every_steps=1,
+        record_camera="watching",
+    ):
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
 
         self.render = render
         self.viewer = None
+        self.renderer = None
+        self.record_enabled = bool(record_path)
+        self.record_path = Path(record_path).expanduser().resolve() if record_path else None
+        self.record_fps = max(1, int(record_fps))
+        self.record_width = max(64, int(record_width))
+        self.record_height = max(64, int(record_height))
+        self.record_every_steps = max(1, int(record_every_steps))
+        self.record_camera = str(record_camera) if record_camera else None
+        self.record_step_counter = 0
+        self.record_frame_idx = 0
+        self.record_writer = None
+        self.record_frames_dir = None
+        self.record_mode = "disabled"
+        self._record_camera_fallback_used = False
 
         if self.render:
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
@@ -70,6 +95,9 @@ class MujocoSimulator:
         for _ in range(50):
             mujoco.mj_step(self.model, self.data)
 
+        if self.record_enabled:
+            self._init_recording()
+
     # ------------------------------------------------
     # Utility ID helpers
     # ------------------------------------------------
@@ -100,8 +128,84 @@ class MujocoSimulator:
             mujoco.mj_step(self.model, self.data)
             if not self._is_dynamics_finite():
                 self._recover_from_instability()
+            self._capture_record_frame()
             if self.viewer:
                 self.viewer.sync()
+
+    def _init_recording(self):
+        if self.record_path is None:
+            self.record_enabled = False
+            return
+        self.record_path.parent.mkdir(parents=True, exist_ok=True)
+        if not hasattr(mujoco, "Renderer"):
+            print("[Record] mujoco.Renderer is not available. Video recording disabled.")
+            self.record_enabled = False
+            return
+
+        self.renderer = mujoco.Renderer(
+            self.model,
+            width=self.record_width,
+            height=self.record_height,
+        )
+
+        try:
+            import imageio.v2 as imageio
+
+            writer_kwargs = {"fps": self.record_fps}
+            if self.record_path.suffix.lower() == ".mp4":
+                writer_kwargs["codec"] = "libx264"
+            self.record_writer = imageio.get_writer(str(self.record_path), **writer_kwargs)
+            self.record_mode = "video"
+            print(
+                f"[Record] video={self.record_path} fps={self.record_fps} "
+                f"size={self.record_width}x{self.record_height} every={self.record_every_steps}step"
+            )
+        except Exception as exc:
+            stem = self.record_path.stem if self.record_path.stem else "sim_record"
+            self.record_frames_dir = self.record_path.parent / f"{stem}_frames"
+            self.record_frames_dir.mkdir(parents=True, exist_ok=True)
+            self.record_mode = "frames"
+            print(
+                f"[Record] imageio unavailable ({type(exc).__name__}). "
+                f"Saving PNG frames to {self.record_frames_dir} instead."
+            )
+
+    def _capture_record_frame(self):
+        if not self.record_enabled or self.renderer is None:
+            return
+        self.record_step_counter += 1
+        if (self.record_step_counter - 1) % self.record_every_steps != 0:
+            return
+
+        try:
+            if self.record_camera:
+                self.renderer.update_scene(self.data, camera=self.record_camera)
+            else:
+                self.renderer.update_scene(self.data)
+        except Exception:
+            self.renderer.update_scene(self.data)
+            if not self._record_camera_fallback_used:
+                self._record_camera_fallback_used = True
+                if self.record_camera:
+                    print(
+                        f"[Record] camera='{self.record_camera}' not found. "
+                        "Falling back to default camera."
+                    )
+        frame = self.renderer.render()
+
+        if self.record_mode == "video" and self.record_writer is not None:
+            self.record_writer.append_data(frame)
+        elif self.record_mode == "frames" and self.record_frames_dir is not None:
+            try:
+                from PIL import Image
+            except Exception as exc:
+                raise RuntimeError(
+                    "Pillow is required for frame-sequence fallback recording."
+                ) from exc
+            out_path = self.record_frames_dir / f"frame_{self.record_frame_idx:06d}.png"
+            Image.fromarray(frame).save(out_path)
+
+        self.record_frame_idx += 1
 
     def _is_dynamics_finite(self):
         return (
@@ -124,6 +228,25 @@ class MujocoSimulator:
         self.data.mocap_pos[self.mocap_id] = np.clip(ee_pos, self.workspace_min, self.workspace_max)
         mujoco.mj_forward(self.model, self.data)
 
+    def close(self):
+        if self.record_writer is not None:
+            self.record_writer.close()
+            self.record_writer = None
+            print(
+                f"[Record] saved {self.record_frame_idx} frame(s) to {self.record_path}"
+            )
+        elif self.record_mode == "frames" and self.record_frames_dir is not None:
+            print(
+                f"[Record] saved {self.record_frame_idx} PNG frame(s) to {self.record_frames_dir}"
+            )
+
+        if self.renderer is not None and hasattr(self.renderer, "close"):
+            self.renderer.close()
+            self.renderer = None
+        if self.viewer is not None and hasattr(self.viewer, "close"):
+            self.viewer.close()
+            self.viewer = None
+
     # ------------------------------------------------
     # State access (GROUND TRUTH - internal only)
     # ------------------------------------------------
@@ -140,6 +263,7 @@ class MujocoSimulator:
         obj_gripper_contact = self.get_object_gripper_contact()
 
         return {
+            "sim_time": float(self.data.time),
             "ee_pos": ee_pos,
             "obj_pos": obj_pos,
             "obj_quat_wxyz": self.get_object_orientation_quat(),

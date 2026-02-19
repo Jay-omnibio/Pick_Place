@@ -1,6 +1,7 @@
 import csv
 import os
 import math
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -73,14 +74,70 @@ class ActiveInferenceAgent:
                 reach_reentry_cooldown_steps=int(
                     self.active_inference_params.get("reach_reentry_cooldown_steps", 20)
                 ),
+                progress_eps=float(self.active_inference_params.get("reach_progress_eps", 1e-3)),
+                no_progress_limit=int(self.active_inference_params.get("reach_stall_steps", 240)),
+                set_priors_enabled=bool(self.active_inference_params.get("bt_set_priors_enabled", True)),
+                retry_reach_z_step=float(self.active_inference_params.get("bt_retry_reach_z_step", 0.005)),
+                retry_reach_z_max=float(self.active_inference_params.get("bt_retry_reach_z_max", 0.02)),
+                vfe_recover_enabled=bool(self.active_inference_params.get("vfe_recover_enabled", False)),
+                vfe_recover_threshold=float(self.active_inference_params.get("vfe_recover_threshold", 2.0)),
+                vfe_recover_steps=int(self.active_inference_params.get("vfe_recover_steps", 50)),
             )
             if self.control_mode == "active_inference"
             else None
         )
+        self.ai_risk_detection_enabled = bool(
+            self.active_inference_params.get("risk_detection_enabled", False)
+        )
+        self.ai_singularity_dq_ratio_threshold = float(
+            self.active_inference_params.get("singularity_dq_ratio_threshold", 5.0)
+        )
+        self.ai_singularity_no_progress_steps = int(
+            self.active_inference_params.get("singularity_no_progress_steps", 30)
+        )
+        self.ai_unintended_contact_warn_steps = int(
+            self.active_inference_params.get("unintended_contact_warn_steps", 12)
+        )
+        self.ai_risk_progress_eps = float(self.active_inference_params.get("reach_progress_eps", 0.002))
+        self.ai_prev_risk_phase = ""
+        self.ai_prev_phase_error = None
+        self.ai_phase_no_progress_steps = 0
+        self.ai_singularity_counter = 0
+        self.ai_unintended_contact_counter = 0
+        self.ai_risk_state = {
+            "dq_ratio": 0.0,
+            "phase_no_progress_steps": 0,
+            "singularity_counter": 0,
+            "singularity_warn": 0,
+            "unexpected_contact": 0,
+            "unintended_contact_counter": 0,
+            "unintended_contact_warn": 0,
+        }
+        # Runtime timing/freshness monitoring (P0.1 robotics observability).
+        self.loop_target_hz = float(os.getenv("LOOP_TARGET_HZ", "50.0"))
+        self.loop_target_ms = (
+            (1000.0 / self.loop_target_hz) if self.loop_target_hz > 0.0 else 20.0
+        )
+        self.loop_dt_warn_ms = float(os.getenv("LOOP_DT_WARN_MS", "40.0"))
+        self.obs_age_warn_ms = float(os.getenv("OBS_AGE_WARN_MS", "120.0"))
+        self._last_step_wall_time = None
+        self.loop_dt_ms = 0.0
+        self.loop_dt_ema_ms = 0.0
+        self.loop_jitter_ms = 0.0
+        self.loop_dt_max_ms = 0.0
+        self.loop_overrun_count = 0
+        self.obs_timestamp = 0.0
+        self.obs_age_ms = 0.0
+        self.obs_stale_warn = 0
+        self._prev_obs_timestamp = None
+        self._prev_obs_stale_warn = 0
         self._ai_settle_logged = False
         self.prev_phase = None
         self.prev_contact = None
         self.prev_escape_active = 0
+        self.prev_ai_release_warning = 0
+        self.prev_ai_singularity_warn = 0
+        self.prev_ai_unintended_contact_warn = 0
         self.log_contact_events = self._env_flag("LOG_CONTACT_EVENTS", False)
         self.log_pose_debug = self._env_flag("LOG_POSE_DEBUG", False)
         self.pause_on_reach_to_descend = self._env_flag("PAUSE_ON_REACH_TO_DESCEND", True)
@@ -119,6 +176,19 @@ class ActiveInferenceAgent:
         return [
             "step",
             "phase",
+            "sim_time",
+            "obs_timestamp",
+            "obs_age_ms",
+            "obs_stale_warn",
+            "loop_dt_ms",
+            "loop_dt_ema_ms",
+            "loop_jitter_ms",
+            "loop_target_ms",
+            "loop_overrun_count",
+            "obs_dt_s",
+            "est_ee_vel_norm",
+            "est_obj_vel_norm",
+            "est_target_vel_norm",
             "distance_to_object",
             "reach_error",
             "pregrasp_error",
@@ -156,6 +226,13 @@ class ActiveInferenceAgent:
             "true_hand_roll",
             "true_hand_pitch",
             "true_hand_yaw",
+            "ai_obs_confidence",
+            "ai_vfe_total",
+            "ai_phase_conf_ok",
+            "ai_phase_vfe_ok",
+            "ai_phase_gate_ok",
+            "ai_bt_status",
+            "ai_bt_reason",
         ]
 
     @staticmethod
@@ -242,6 +319,194 @@ class ActiveInferenceAgent:
         if self.task_state is None:
             return ""
         return Phase(self.task_state.phase).value
+
+    def _reset_ai_risk_state(self):
+        self.ai_prev_risk_phase = ""
+        self.ai_prev_phase_error = None
+        self.ai_phase_no_progress_steps = 0
+        self.ai_singularity_counter = 0
+        self.ai_unintended_contact_counter = 0
+        self.ai_risk_state = {
+            "dq_ratio": 0.0,
+            "phase_no_progress_steps": 0,
+            "singularity_counter": 0,
+            "singularity_warn": 0,
+            "unexpected_contact": 0,
+            "unintended_contact_counter": 0,
+            "unintended_contact_warn": 0,
+        }
+
+    @staticmethod
+    def _safe_norm(vec):
+        n = float(np.linalg.norm(np.asarray(vec, dtype=float)))
+        if not np.isfinite(n):
+            return float("inf")
+        return n
+
+    @staticmethod
+    def _safe_float_scalar(value, default=0.0):
+        try:
+            arr = np.asarray(value, dtype=float).reshape(-1)
+            if arr.size > 0 and np.isfinite(arr[0]):
+                return float(arr[0])
+        except (TypeError, ValueError):
+            pass
+        return float(default)
+
+    def _update_runtime_timing(self):
+        now = time.perf_counter()
+        if self._last_step_wall_time is None:
+            self.loop_dt_ms = self.loop_target_ms
+            self.loop_dt_ema_ms = self.loop_dt_ms
+            self.loop_jitter_ms = 0.0
+        else:
+            dt_ms = max(0.0, (now - self._last_step_wall_time) * 1000.0)
+            self.loop_dt_ms = dt_ms
+            self.loop_jitter_ms = abs(dt_ms - self.loop_target_ms)
+            alpha = 0.15
+            self.loop_dt_ema_ms = (1.0 - alpha) * self.loop_dt_ema_ms + alpha * dt_ms
+            if dt_ms > self.loop_dt_max_ms:
+                self.loop_dt_max_ms = dt_ms
+            if dt_ms > self.loop_dt_warn_ms:
+                self.loop_overrun_count += 1
+        self._last_step_wall_time = now
+
+    def _update_observation_freshness(self, sim_state, observation):
+        sim_time = self._safe_float_scalar(sim_state.get("sim_time", 0.0), default=0.0)
+        obs_ts = self._safe_float_scalar(observation.get("o_timestamp", sim_time), default=sim_time)
+        self.obs_timestamp = obs_ts
+        age_s = sim_time - obs_ts
+        if not np.isfinite(age_s):
+            age_s = 0.0
+        # Do not report negative age from minor timestamp order noise.
+        age_s = max(0.0, age_s)
+        self.obs_age_ms = age_s * 1000.0
+        self.obs_stale_warn = int(self.obs_age_ms > self.obs_age_warn_ms)
+
+        if self._prev_obs_timestamp is not None and obs_ts < self._prev_obs_timestamp - 1e-9:
+            print(
+                f"[ObsWarn] step={self.step_count} non_monotonic_ts "
+                f"prev={self._prev_obs_timestamp:.6f} now={obs_ts:.6f}"
+            )
+        if self.obs_stale_warn == 1 and self._prev_obs_stale_warn == 0:
+            print(
+                f"[ObsWarn] step={self.step_count} stale_observation "
+                f"obs_age_ms={self.obs_age_ms:.1f} threshold_ms={self.obs_age_warn_ms:.1f}"
+            )
+        self._prev_obs_timestamp = obs_ts
+        self._prev_obs_stale_warn = self.obs_stale_warn
+
+    def _ai_phase_error(self):
+        if self.current_belief is None:
+            return None
+        b = self.current_belief
+        phase = str(b.get("phase", "Reach"))
+        s_obj = np.asarray(b.get("s_obj_mean", [0.0, 0.0, 0.0]), dtype=float)
+        s_target = np.asarray(b.get("s_target_mean", [0.0, 0.0, 0.0]), dtype=float)
+        s_ee = np.asarray(b.get("s_ee_mean", [0.0, 0.0, 0.0]), dtype=float)
+
+        if phase == "Reach":
+            return self._safe_norm(s_obj - np.asarray(b.get("reach_obj_rel", [0.0, 0.0, 0.0]), dtype=float))
+        if phase in ("Align", "PreGraspHold"):
+            return self._safe_norm(s_obj - np.asarray(b.get("align_obj_rel", [0.0, 0.0, 0.0]), dtype=float))
+        if phase in ("Descend", "CloseHold", "LiftTest"):
+            return self._safe_norm(s_obj - np.asarray(b.get("descend_obj_rel", [0.0, 0.0, 0.0]), dtype=float))
+        if phase == "MoveToPlaceAbove":
+            return self._safe_norm(
+                s_target - np.asarray(b.get("preplace_target_rel", [0.0, 0.0, 0.0]), dtype=float)
+            )
+        if phase == "DescendToPlace":
+            return self._safe_norm(
+                s_target - np.asarray(b.get("place_target_rel", [0.0, 0.0, 0.0]), dtype=float)
+            )
+        if phase == "Transit":
+            transit_target = float(self.active_inference_params.get("transit_height", 0.35))
+            return abs(transit_target - float(s_ee[2]))
+        return None
+
+    def _update_ai_risk_detection(self, observation):
+        if (
+            self.control_mode != "active_inference"
+            or self.current_belief is None
+            or not self.ai_risk_detection_enabled
+        ):
+            self._reset_ai_risk_state()
+            return
+
+        phase = str(self.current_belief.get("phase", "Reach"))
+        phase_error = self._ai_phase_error()
+        if phase != self.ai_prev_risk_phase:
+            self.ai_prev_risk_phase = phase
+            self.ai_prev_phase_error = phase_error
+            self.ai_phase_no_progress_steps = 0
+        elif phase_error is None or not np.isfinite(float(phase_error)):
+            self.ai_prev_phase_error = phase_error
+            self.ai_phase_no_progress_steps = 0
+        else:
+            prev_err = self.ai_prev_phase_error
+            if prev_err is None or not np.isfinite(float(prev_err)):
+                self.ai_phase_no_progress_steps = 0
+            elif float(phase_error) < (float(prev_err) - self.ai_risk_progress_eps):
+                self.ai_phase_no_progress_steps = 0
+            else:
+                self.ai_phase_no_progress_steps += 1
+            self.ai_prev_phase_error = float(phase_error)
+
+        controller = getattr(self.actuator_backend, "controller", None)
+        if controller is not None:
+            dq_raw = float(getattr(controller, "last_dq_norm_raw", 0.0))
+            dq_applied = float(getattr(controller, "last_dq_norm_applied", 0.0))
+        else:
+            dq_raw = 0.0
+            dq_applied = 0.0
+        dq_ratio = dq_raw / max(dq_applied, 1e-6)
+        singularity_like = (
+            dq_ratio >= self.ai_singularity_dq_ratio_threshold
+            and self.ai_phase_no_progress_steps > 0
+        )
+        if singularity_like:
+            self.ai_singularity_counter += 1
+        else:
+            self.ai_singularity_counter = 0
+        singularity_warn = int(self.ai_singularity_counter >= self.ai_singularity_no_progress_steps)
+
+        contact = int(observation.get("o_contact", 0))
+        expected_contact = phase in (
+            "CloseHold",
+            "LiftTest",
+            "Transit",
+            "MoveToPlaceAbove",
+            "DescendToPlace",
+            "Open",
+            "Retreat",
+            "Done",
+        )
+        if phase == "Descend":
+            desc_vec = np.asarray(self.current_belief.get("s_obj_mean", [0.0, 0.0, 0.0]), dtype=float) - np.asarray(
+                self.current_belief.get("descend_obj_rel", [0.0, 0.0, 0.0]), dtype=float
+            )
+            desc_z_err = abs(float(desc_vec[2]))
+            desc_z_thr = float(self.active_inference_params.get("descend_z_threshold", 0.01))
+            expected_contact = desc_z_err <= (2.0 * desc_z_thr)
+
+        unexpected_contact = int(contact == 1 and not expected_contact)
+        if unexpected_contact:
+            self.ai_unintended_contact_counter += 1
+        else:
+            self.ai_unintended_contact_counter = 0
+        unintended_contact_warn = int(
+            self.ai_unintended_contact_counter >= self.ai_unintended_contact_warn_steps
+        )
+
+        self.ai_risk_state = {
+            "dq_ratio": float(dq_ratio),
+            "phase_no_progress_steps": int(self.ai_phase_no_progress_steps),
+            "singularity_counter": int(self.ai_singularity_counter),
+            "singularity_warn": int(singularity_warn),
+            "unexpected_contact": int(unexpected_contact),
+            "unintended_contact_counter": int(self.ai_unintended_contact_counter),
+            "unintended_contact_warn": int(unintended_contact_warn),
+        }
 
     def _get_references(self):
         if self.control_mode == "active_inference":
@@ -344,8 +609,8 @@ class ActiveInferenceAgent:
             "true_place_y_error": float(abs(true_place_err_vec[1])),
             "true_place_z_error": float(abs(true_place_err_vec[2])),
             "true_place_xy_error": float(np.linalg.norm(true_place_err_vec[:2])),
-            "obs_preplace_error": float(np.linalg.norm(target_rel - self.task_cfg.preplace_target_rel)),
-            "obs_place_error": float(np.linalg.norm(target_rel - self.task_cfg.place_target_rel)),
+            "obs_preplace_error": float(np.linalg.norm(target_rel - preplace_ref)),
+            "obs_place_error": float(np.linalg.norm(target_rel - place_ref)),
             "true_ee_z": float(ee_pos[2]),
             "true_obj_z": float(obj_pos[2]),
             "workspace_min_z": float(
@@ -374,7 +639,13 @@ class ActiveInferenceAgent:
         contact = int(observation.get("o_contact", 0))
         grip_cmd = int(action.get("grip", 0))
         m = self._collect_log_metrics(sim_state, observation)
+        obs_dt_s = self._safe_float_scalar(observation.get("o_dt", 0.0), default=0.0)
         msg = f"[HB] step={self.step_count} phase={phase} contact={contact} grip={grip_cmd}"
+        msg += (
+            f" obs_age={self.obs_age_ms:.1f}ms stale={self.obs_stale_warn} "
+            f"loop={self.loop_dt_ms:.1f}ms jit={self.loop_jitter_ms:.1f}ms "
+            f"obs_dt={obs_dt_s:.4f}s"
+        )
 
         if phase == "Reach" and self.control_mode == "active_inference" and self.current_belief is not None:
             turn_sign = int(self.current_belief.get("reach_turn_sign", 0))
@@ -401,23 +672,55 @@ class ActiveInferenceAgent:
             )
 
         elif phase == Phase.Descend.value:
-            msg += (
-                f" x={m['true_descend_x_error']:.4f}/{self.task_cfg.descend_x_threshold:.4f} "
-                f"y={m['true_descend_y_error']:.4f}/{self.task_cfg.descend_y_threshold:.4f} "
-                f"xy={m['true_descend_xy_error']:.4f}/{self.task_cfg.descend_threshold:.4f} "
-                f"z={m['true_descend_z_error']:.4f}/{self.task_cfg.descend_z_threshold:.4f}"
-            )
-            gate = self._descend_gate_for_logging(observation)
-            if gate is not None:
-                blockers = ",".join(gate.get("blockers", [])) if gate.get("blockers") else "-"
-                msg += (
-                    f" ee_z={m['true_ee_z']:.4f} obj_z={m['true_obj_z']:.4f} min_z={m['workspace_min_z']:.4f} "
-                    f"gate={gate['trigger']} "
-                    f"ready={gate['ready_counter']}/{self.task_cfg.descend_ready_steps} "
-                    f"hold={gate['contact_hold']}/{self.task_cfg.descend_stop_contact_steps} "
-                    f"step={gate['step_in_phase']}/{self.task_cfg.descend_max_steps} "
-                    f"blockers={blockers}"
+            if self.control_mode == "active_inference":
+                ai_descend_x_thr = float(
+                    self.active_inference_params.get("descend_x_threshold", self.task_cfg.descend_x_threshold)
                 )
+                ai_descend_y_thr = float(
+                    self.active_inference_params.get("descend_y_threshold", self.task_cfg.descend_y_threshold)
+                )
+                ai_descend_z_thr = float(
+                    self.active_inference_params.get("descend_z_threshold", self.task_cfg.descend_z_threshold)
+                )
+                ai_descend_thr = float(
+                    self.active_inference_params.get("descend_threshold", self.task_cfg.descend_threshold)
+                )
+                ai_descend_step = int(self.current_belief.get("descend_timer", 0)) if self.current_belief else 0
+                ai_descend_max_steps = int(self.active_inference_params.get("descend_max_steps", 0))
+                ai_descend_no_progress = (
+                    int(self.current_belief.get("descend_no_progress_steps", 0)) if self.current_belief else 0
+                )
+                ai_descend_ext = (
+                    int(self.current_belief.get("descend_timeout_extensions", 0)) if self.current_belief else 0
+                )
+                ai_descend_ext_max = int(self.active_inference_params.get("descend_max_timeout_extensions", 0))
+                msg += (
+                    f" x={m['true_descend_x_error']:.4f}/{ai_descend_x_thr:.4f} "
+                    f"y={m['true_descend_y_error']:.4f}/{ai_descend_y_thr:.4f} "
+                    f"xy={m['true_descend_xy_error']:.4f}/{ai_descend_thr:.4f} "
+                    f"z={m['true_descend_z_error']:.4f}/{ai_descend_z_thr:.4f} "
+                    f"step={ai_descend_step}/{ai_descend_max_steps} "
+                    f"stall={ai_descend_no_progress} "
+                    f"ext={ai_descend_ext}/{ai_descend_ext_max}"
+                )
+            else:
+                msg += (
+                    f" x={m['true_descend_x_error']:.4f}/{self.task_cfg.descend_x_threshold:.4f} "
+                    f"y={m['true_descend_y_error']:.4f}/{self.task_cfg.descend_y_threshold:.4f} "
+                    f"xy={m['true_descend_xy_error']:.4f}/{self.task_cfg.descend_threshold:.4f} "
+                    f"z={m['true_descend_z_error']:.4f}/{self.task_cfg.descend_z_threshold:.4f}"
+                )
+                gate = self._descend_gate_for_logging(observation)
+                if gate is not None:
+                    blockers = ",".join(gate.get("blockers", [])) if gate.get("blockers") else "-"
+                    msg += (
+                        f" ee_z={m['true_ee_z']:.4f} obj_z={m['true_obj_z']:.4f} min_z={m['workspace_min_z']:.4f} "
+                        f"gate={gate['trigger']} "
+                        f"ready={gate['ready_counter']}/{self.task_cfg.descend_ready_steps} "
+                        f"hold={gate['contact_hold']}/{self.task_cfg.descend_stop_contact_steps} "
+                        f"step={gate['step_in_phase']}/{self.task_cfg.descend_max_steps} "
+                        f"blockers={blockers}"
+                    )
         elif phase == Phase.Close.value and self.task_state is not None:
             msg += (
                 f" x={m['true_descend_x_error']:.4f}/{self.task_cfg.descend_x_threshold:.4f} "
@@ -512,6 +815,31 @@ class ActiveInferenceAgent:
                 f"desc=({m['true_descend_x_error']:.4f},{m['true_descend_y_error']:.4f},{m['true_descend_z_error']:.4f})"
             )
 
+        if self.control_mode == "active_inference" and self.current_belief is not None:
+            conf = float(self.current_belief.get("obs_confidence", 1.0))
+            vfe = float(self.current_belief.get("vfe_total", 0.0))
+            conf_ok = int(self.current_belief.get("phase_conf_ok", 1))
+            vfe_ok = int(self.current_belief.get("phase_vfe_ok", 1))
+            msg += f" conf={conf:.2f}"
+            msg += f" vfe={vfe:.3f}"
+            msg += f" gate={conf_ok}:{vfe_ok}"
+            msg += f" overrun={self.loop_overrun_count}"
+            release_warn = int(self.current_belief.get("release_warning", 0))
+            if phase == "Open" or release_warn == 1:
+                release_counter = int(self.current_belief.get("release_contact_counter", 0))
+                release_warn_steps = int(self.active_inference_params.get("release_contact_warn_steps", 0))
+                msg += (
+                    f" release_hold={release_counter}/{release_warn_steps} "
+                    f"release_warn={release_warn}"
+                )
+            if self.ai_risk_detection_enabled:
+                rs = self.ai_risk_state
+                msg += (
+                    f" dq_ratio={float(rs.get('dq_ratio', 0.0)):.2f} "
+                    f"sing={int(rs.get('singularity_warn', 0))} "
+                    f"uc={int(rs.get('unintended_contact_warn', 0))}"
+                )
+
         if self.control_mode == "active_inference" and self.ai_bt is not None:
             bt_reason = self.ai_bt.last_reason if self.ai_bt.last_reason else "-"
             msg += f" bt={self.ai_bt.status.value} bt_reason={bt_reason}"
@@ -544,6 +872,14 @@ class ActiveInferenceAgent:
         else:
             move = np.asarray(action.get("move", [0.0, 0.0, 0.0]), dtype=float)
 
+        obs_dt_s = self._safe_float_scalar(observation.get("o_dt", 0.0), default=0.0)
+        ee_vel_obs = np.asarray(observation.get("o_ee_vel", [0.0, 0.0, 0.0]), dtype=float).reshape(-1)
+        obj_vel_obs = np.asarray(observation.get("o_obj_vel", [0.0, 0.0, 0.0]), dtype=float).reshape(-1)
+        tgt_vel_obs = np.asarray(observation.get("o_target_vel", [0.0, 0.0, 0.0]), dtype=float).reshape(-1)
+        ee_vel_norm = self._safe_norm(ee_vel_obs[:3]) if ee_vel_obs.size >= 3 else 0.0
+        obj_vel_norm = self._safe_norm(obj_vel_obs[:3]) if obj_vel_obs.size >= 3 else 0.0
+        tgt_vel_norm = self._safe_norm(tgt_vel_obs[:3]) if tgt_vel_obs.size >= 3 else 0.0
+
         row = {
             "step": self.step_count,
             "phase": (
@@ -551,6 +887,19 @@ class ActiveInferenceAgent:
                 if self.control_mode == "active_inference" and self.current_belief is not None
                 else (self.task_state.phase.value if self.task_state is not None else Phase.ReachAbove.value)
             ),
+            "sim_time": self._safe_float_scalar(sim_state.get("sim_time", 0.0), default=0.0),
+            "obs_timestamp": float(self.obs_timestamp),
+            "obs_age_ms": float(self.obs_age_ms),
+            "obs_stale_warn": int(self.obs_stale_warn),
+            "loop_dt_ms": float(self.loop_dt_ms),
+            "loop_dt_ema_ms": float(self.loop_dt_ema_ms),
+            "loop_jitter_ms": float(self.loop_jitter_ms),
+            "loop_target_ms": float(self.loop_target_ms),
+            "loop_overrun_count": int(self.loop_overrun_count),
+            "obs_dt_s": float(obs_dt_s),
+            "est_ee_vel_norm": float(ee_vel_norm),
+            "est_obj_vel_norm": float(obj_vel_norm),
+            "est_target_vel_norm": float(tgt_vel_norm),
             "distance_to_object": float(np.linalg.norm(obj_rel)),
             "reach_error": pregrasp_error,
             "pregrasp_error": pregrasp_error,
@@ -586,6 +935,24 @@ class ActiveInferenceAgent:
             "true_target_z": float(sim_state["target_pos"][2]),
             "true_joint7_pos": float(sim_state.get("joint7_pos", 0.0)),
         }
+        if self.control_mode == "active_inference" and self.current_belief is not None:
+            row["ai_obs_confidence"] = float(self.current_belief.get("obs_confidence", 1.0))
+            row["ai_vfe_total"] = float(self.current_belief.get("vfe_total", 0.0))
+            row["ai_phase_conf_ok"] = int(self.current_belief.get("phase_conf_ok", 1))
+            row["ai_phase_vfe_ok"] = int(self.current_belief.get("phase_vfe_ok", 1))
+            row["ai_phase_gate_ok"] = int(self.current_belief.get("phase_gate_ok", 1))
+            row["ai_bt_status"] = (
+                self.ai_bt.status.value if (self.ai_bt is not None and self.ai_bt.status is not None) else ""
+            )
+            row["ai_bt_reason"] = self.ai_bt.last_reason if self.ai_bt is not None else ""
+        else:
+            row["ai_obs_confidence"] = ""
+            row["ai_vfe_total"] = ""
+            row["ai_phase_conf_ok"] = ""
+            row["ai_phase_vfe_ok"] = ""
+            row["ai_phase_gate_ok"] = ""
+            row["ai_bt_status"] = ""
+            row["ai_bt_reason"] = ""
         hand_quat = sim_state.get("hand_quat_wxyz")
         if hand_quat is not None:
             hr, hp, hy = self._quat_wxyz_to_rpy(hand_quat)
@@ -766,9 +1133,11 @@ class ActiveInferenceAgent:
         )
 
     def step(self):
+        self._update_runtime_timing()
         sim_state = self.simulator.get_state()
         self.ee_true_history.append(np.array(sim_state["ee_pos"], dtype=float))
         observation = self.sensor_backend.get_observation(sim_state)
+        self._update_observation_freshness(sim_state, observation)
         self.obs_history.append(observation)
 
         if self.control_mode == "active_inference":
@@ -782,6 +1151,7 @@ class ActiveInferenceAgent:
                     "enable_yaw_objective": False,
                     "enable_topdown_objective": True,
                 }
+                self._reset_ai_risk_state()
             else:
                 self.current_belief = infer_beliefs(
                     observation=observation,
@@ -797,6 +1167,7 @@ class ActiveInferenceAgent:
                             f"retry={int(self.current_belief.get('retry_count', 0))}"
                         )
                 action = select_action(self.current_belief, params=self.active_inference_params)
+                self._update_ai_risk_detection(observation)
         else:
             prev_task_state = self.task_state
             descend_gate = None
@@ -913,6 +1284,14 @@ class ActiveInferenceAgent:
             self.prev_contact = contact
             self.prev_escape_active = self.escape_active
             self.prev_action_grip = int(action.get("grip", 0))
+            if self.control_mode == "active_inference" and self.current_belief is not None:
+                self.prev_ai_release_warning = int(self.current_belief.get("release_warning", 0))
+            else:
+                self.prev_ai_release_warning = 0
+            self.prev_ai_singularity_warn = int(self.ai_risk_state.get("singularity_warn", 0))
+            self.prev_ai_unintended_contact_warn = int(
+                self.ai_risk_state.get("unintended_contact_warn", 0)
+            )
             print(
                 f"[Init] phase={phase} contact={contact} "
                 f"log_format=v2 "
@@ -987,6 +1366,39 @@ class ActiveInferenceAgent:
                 f"[Recovery] step={self.step_count} state={label} "
                 f"action_move={action.get('move', action.get('ee_target_pos', []))} ee={sim_state['ee_pos'].tolist()}"
             )
+
+        if self.control_mode == "active_inference" and self.current_belief is not None:
+            release_warn = int(self.current_belief.get("release_warning", 0))
+            if release_warn == 1 and self.prev_ai_release_warning == 0:
+                release_counter = int(self.current_belief.get("release_contact_counter", 0))
+                release_warn_steps = int(self.active_inference_params.get("release_contact_warn_steps", 0))
+                print(
+                    f"[AI-ReleaseWarn] step={self.step_count} phase={phase} "
+                    f"contact_hold={release_counter}/{release_warn_steps}"
+                )
+            singularity_warn = int(self.ai_risk_state.get("singularity_warn", 0))
+            if singularity_warn == 1 and self.prev_ai_singularity_warn == 0:
+                print(
+                    f"[AI-Risk] step={self.step_count} type=singularity_like "
+                    f"phase={phase} dq_ratio={float(self.ai_risk_state.get('dq_ratio', 0.0)):.2f} "
+                    f"stall={int(self.ai_risk_state.get('phase_no_progress_steps', 0))} "
+                    f"counter={int(self.ai_risk_state.get('singularity_counter', 0))}/"
+                    f"{self.ai_singularity_no_progress_steps}"
+                )
+            unintended_warn = int(self.ai_risk_state.get("unintended_contact_warn", 0))
+            if unintended_warn == 1 and self.prev_ai_unintended_contact_warn == 0:
+                print(
+                    f"[AI-Risk] step={self.step_count} type=unexpected_contact "
+                    f"phase={phase} counter={int(self.ai_risk_state.get('unintended_contact_counter', 0))}/"
+                    f"{self.ai_unintended_contact_warn_steps}"
+                )
+            self.prev_ai_release_warning = release_warn
+            self.prev_ai_singularity_warn = singularity_warn
+            self.prev_ai_unintended_contact_warn = unintended_warn
+        else:
+            self.prev_ai_release_warning = 0
+            self.prev_ai_singularity_warn = 0
+            self.prev_ai_unintended_contact_warn = 0
 
         self.prev_phase = phase
         self.prev_contact = contact

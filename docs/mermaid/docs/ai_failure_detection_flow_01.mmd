@@ -1,0 +1,9 @@
+flowchart TD
+    A[agent.step in active_inference] --> B[infer_beliefs]
+    B --> C[update obs_confidence]
+    C --> D[phase transition gates use confidence]
+    D --> E[select_action]
+    E --> F[_update_ai_risk_detection]
+    F --> G[risk state fields updated]
+    G --> H[_log_heartbeat]
+    H --> I[_log_events]

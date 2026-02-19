@@ -39,6 +39,7 @@ class SensorSuite:
         obj_yaw_obs = self._sense_object_yaw(sim_state)
         grip_obs = self._sense_gripper(sim_state)
         contact_obs = self._sense_contact(sim_state)
+        obs_time = float(sim_state.get("sim_time", 0.0))
 
         return {
             "o_ee": ee_obs,
@@ -47,6 +48,7 @@ class SensorSuite:
             "o_obj_yaw": obj_yaw_obs,
             "o_grip": grip_obs,
             "o_contact": contact_obs,
+            "o_timestamp": obs_time,
         }
 
     # -------------------------------
