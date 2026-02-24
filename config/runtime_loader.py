@@ -16,7 +16,8 @@ DEFAULT_COMMON_CONFIG_PATH = "config/common_robot.yaml"
 DEFAULT_FSM_CONFIG_PATH = "config/fsm_config.yaml"
 DEFAULT_ACTIVE_INFERENCE_CONFIG_PATH = "config/active_inference_config.yaml"
 
-COMMON_TOP_LEVEL_KEYS = {"run", "controller"}
+COMMON_REQUIRED_TOP_LEVEL_KEYS = {"run", "controller"}
+COMMON_ALLOWED_TOP_LEVEL_KEYS = COMMON_REQUIRED_TOP_LEVEL_KEYS | {"task_shared"}
 FSM_TOP_LEVEL_KEYS = {"task", "policy"}
 ACTIVE_TOP_LEVEL_KEYS = {"inference", "action_selection"}
 
@@ -47,6 +48,14 @@ REQUIRED_CONTROLLER_KEYS = {
     "gripper_speed_tol",
     "gripper_switch_cooldown_steps",
     "debug_every_steps",
+}
+
+REQUIRED_TASK_SHARED_KEYS = {
+    "target_world_xyz",
+    "target_world_yaw_deg",
+}
+OPTIONAL_TASK_SHARED_KEYS = {
+    "target_world_pose6d_deg",
 }
 
 REQUIRED_AI_INFERENCE_KEYS = {
@@ -101,6 +110,12 @@ REQUIRED_AI_INFERENCE_KEYS = {
     "bt_set_priors_enabled",
     "bt_retry_reach_z_step",
     "bt_retry_reach_z_max",
+    "bt_branch_retry_cap",
+    "bt_global_recovery_cap",
+    "bt_rescan_hold_steps",
+    "bt_reapproach_offset_xy",
+    "bt_safe_backoff_hold_steps",
+    "bt_safe_backoff_z_boost",
     "vfe_enabled",
     "vfe_epistemic_weight",
     "vfe_phase_change_enabled",
@@ -109,6 +124,14 @@ REQUIRED_AI_INFERENCE_KEYS = {
     "vfe_recover_threshold",
     "vfe_recover_steps",
     "release_contact_warn_steps",
+    "release_verify_enabled",
+    "release_detach_hold_steps",
+    "release_stable_hold_steps",
+    "release_obj_xy_threshold",
+    "release_obj_z_threshold",
+    "release_obj_speed_threshold",
+    "open_max_steps",
+    "release_reapproach_max_retries",
     "risk_detection_enabled",
     "singularity_dq_ratio_threshold",
     "singularity_no_progress_steps",
@@ -116,12 +139,21 @@ REQUIRED_AI_INFERENCE_KEYS = {
     "alpha_target",
     "preplace_target_rel",
     "place_target_rel",
+    "place_goal_yaw_enabled",
+    "place_goal_yaw_threshold_deg",
+    "place_goal_yaw_pi_symmetric",
     "preplace_threshold",
     "place_threshold",
     "preplace_xy_threshold",
     "preplace_z_threshold",
     "place_xy_threshold",
     "place_z_threshold",
+    "place_descend_max_steps",
+    "place_descend_progress_eps",
+    "place_descend_stall_steps",
+    "place_descend_timeout_extension_steps",
+    "place_descend_max_timeout_extensions",
+    "place_reapproach_max_retries",
     "transit_height",
     "transit_z_threshold",
     "open_hold_steps",
@@ -151,6 +183,14 @@ REQUIRED_AI_ACTION_KEYS = {
     "confidence_speed_min_scale",
     "reach_confidence_speed_power",
     "descend_confidence_speed_power",
+    "place_goal_gripper_yaw_offset_deg",
+}
+
+OPTIONAL_AI_INFERENCE_KEYS = {
+    "use_world_place_goal_pose",
+    "place_goal_world_xyz",
+    "place_goal_world_yaw_deg",
+    "place_goal_world_pose6d_deg",
 }
 
 AI_VECTOR_KEYS = {
@@ -159,6 +199,7 @@ AI_VECTOR_KEYS = {
     "descend_obj_rel",
     "preplace_target_rel",
     "place_target_rel",
+    "place_goal_world_xyz",
     "retreat_move",
 }
 AI_BOOL_KEYS = {
@@ -170,6 +211,10 @@ AI_BOOL_KEYS = {
     "vfe_enabled",
     "vfe_phase_change_enabled",
     "vfe_recover_enabled",
+    "release_verify_enabled",
+    "use_world_place_goal_pose",
+    "place_goal_yaw_enabled",
+    "place_goal_yaw_pi_symmetric",
     "confidence_speed_scaling_enabled",
 }
 AI_INT_KEYS = {
@@ -189,12 +234,25 @@ AI_INT_KEYS = {
     "max_retries",
     "contact_on_count",
     "contact_off_count",
+    "bt_branch_retry_cap",
+    "bt_global_recovery_cap",
+    "bt_rescan_hold_steps",
+    "bt_safe_backoff_hold_steps",
     "reach_stall_steps",
     "reach_yaw_align_steps",
     "vfe_recover_steps",
     "release_contact_warn_steps",
+    "release_detach_hold_steps",
+    "release_stable_hold_steps",
+    "open_max_steps",
+    "release_reapproach_max_retries",
     "singularity_no_progress_steps",
     "unintended_contact_warn_steps",
+    "place_descend_max_steps",
+    "place_descend_stall_steps",
+    "place_descend_timeout_extension_steps",
+    "place_descend_max_timeout_extensions",
+    "place_reapproach_max_retries",
     "open_hold_steps",
     "retreat_steps",
 }
@@ -256,13 +314,40 @@ def _coerce_active_section(
     section_name: str,
     data: Dict[str, Any],
     required_keys: set[str],
+    optional_keys: set[str] | None = None,
 ) -> Dict[str, Any]:
-    _check_unknown_keys(section_name, data, required_keys)
+    opt = set(optional_keys or set())
+    allowed_keys = set(required_keys) | opt
+    _check_unknown_keys(section_name, data, allowed_keys)
     _check_missing_keys(section_name, data, required_keys)
 
     out: Dict[str, Any] = {}
     for key in required_keys:
         value = data[key]
+        if key in AI_VECTOR_KEYS:
+            vec = np.asarray(value, dtype=float).reshape(-1)
+            if vec.shape[0] != 3:
+                raise ValueError(f"Section '{section_name}' key '{key}' must be length-3 vector.")
+            out[key] = vec
+        elif key in AI_BOOL_KEYS:
+            out[key] = bool(value)
+        elif key in AI_INT_KEYS:
+            out[key] = int(value)
+        else:
+            out[key] = float(value)
+    for key in opt:
+        if key not in data:
+            continue
+        value = data[key]
+        if key == "place_goal_world_pose6d_deg":
+            vec = np.asarray(value, dtype=float).reshape(-1)
+            if vec.shape[0] != 6:
+                raise ValueError(
+                    f"Section '{section_name}' key '{key}' must be length-6 vector "
+                    "[x,y,z,roll_deg,pitch_deg,yaw_deg]."
+                )
+            out[key] = vec
+            continue
         if key in AI_VECTOR_KEYS:
             vec = np.asarray(value, dtype=float).reshape(-1)
             if vec.shape[0] != 3:
@@ -287,8 +372,8 @@ def load_runtime_sections(
     ai_cfg_path = Path(active_inference_path)
 
     common_raw = _load_yaml_dict(common_cfg_path, "common")
-    _check_unknown_keys("common_root", common_raw, COMMON_TOP_LEVEL_KEYS)
-    _check_missing_keys("common_root", common_raw, COMMON_TOP_LEVEL_KEYS)
+    _check_unknown_keys("common_root", common_raw, COMMON_ALLOWED_TOP_LEVEL_KEYS)
+    _check_missing_keys("common_root", common_raw, COMMON_REQUIRED_TOP_LEVEL_KEYS)
 
     run_cfg = _ensure_dict("run", common_raw["run"])
     _check_unknown_keys("run", run_cfg, REQUIRED_RUN_KEYS)
@@ -329,6 +414,35 @@ def load_runtime_sections(
         "debug_every_steps": int(controller_cfg["debug_every_steps"]),
     }
 
+    shared_task_cfg: Dict[str, Any] = {}
+    if "task_shared" in common_raw:
+        task_shared_cfg = _ensure_dict("task_shared", common_raw["task_shared"])
+        allowed = REQUIRED_TASK_SHARED_KEYS | OPTIONAL_TASK_SHARED_KEYS
+        _check_unknown_keys("task_shared", task_shared_cfg, allowed)
+        _check_missing_keys("task_shared", task_shared_cfg, REQUIRED_TASK_SHARED_KEYS)
+        target_xyz = np.asarray(task_shared_cfg["target_world_xyz"], dtype=float).reshape(-1)
+        if target_xyz.shape[0] != 3:
+            raise ValueError("Section 'task_shared' key 'target_world_xyz' must be length-3 vector.")
+        target_yaw_deg = float(task_shared_cfg["target_world_yaw_deg"])
+        shared_task_cfg = {
+            "target_world_xyz": target_xyz[:3].copy(),
+            "target_world_yaw_deg": target_yaw_deg,
+        }
+        if "target_world_pose6d_deg" in task_shared_cfg:
+            pose6 = np.asarray(task_shared_cfg["target_world_pose6d_deg"], dtype=float).reshape(-1)
+            if pose6.shape[0] != 6:
+                raise ValueError(
+                    "Section 'task_shared' key 'target_world_pose6d_deg' must be length-6 vector "
+                    "[x,y,z,roll_deg,pitch_deg,yaw_deg]."
+                )
+            if not np.all(np.isfinite(pose6)):
+                raise ValueError(
+                    "Section 'task_shared' key 'target_world_pose6d_deg' must contain finite values."
+                )
+            shared_task_cfg["target_world_pose6d_deg"] = pose6.copy()
+            shared_task_cfg["target_world_xyz"] = pose6[:3].copy()
+            shared_task_cfg["target_world_yaw_deg"] = float(pose6[5])
+
     fsm_raw = _load_yaml_dict(fsm_cfg_path, "fsm")
     _check_unknown_keys("fsm_root", fsm_raw, FSM_TOP_LEVEL_KEYS)
     _check_missing_keys("fsm_root", fsm_raw, FSM_TOP_LEVEL_KEYS)
@@ -344,6 +458,7 @@ def load_runtime_sections(
         "active_inference.inference",
         _ensure_dict("active_inference.inference", ai_raw["inference"]),
         REQUIRED_AI_INFERENCE_KEYS,
+        OPTIONAL_AI_INFERENCE_KEYS,
     )
     ai_action_cfg = _coerce_active_section(
         "active_inference.action_selection",
@@ -368,6 +483,7 @@ def load_runtime_sections(
         "strict": True,
         "run_cfg": run_cfg_out,
         "controller_cfg": controller_cfg_out,
+        "shared_task_cfg": shared_task_cfg,
         "task_cfg": task_cfg,
         "policy_cfg": policy_cfg,
         "active_inference_cfg": active_inference_cfg,

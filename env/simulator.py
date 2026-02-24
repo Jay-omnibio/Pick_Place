@@ -332,6 +332,23 @@ class MujocoSimulator:
     def get_target_position(self):
         return self.data.site_xpos[self.target_site_id].copy()
 
+    def set_target_position(self, target_pos):
+        """
+        Set world-frame position of the target site marker.
+        This updates the red target dot used by sensors/logs.
+        """
+        target_world = np.asarray(target_pos, dtype=float).reshape(3)
+        if not np.all(np.isfinite(target_world)):
+            raise ValueError("Target position must contain finite values.")
+
+        site_id = int(self.target_site_id)
+        body_id = int(self.model.site_bodyid[site_id])
+        body_world_pos = np.asarray(self.data.xpos[body_id], dtype=float).reshape(3)
+        body_world_rot = np.asarray(self.data.xmat[body_id], dtype=float).reshape(3, 3)
+        local_pos = body_world_rot.T @ (target_world - body_world_pos)
+        self.model.site_pos[site_id] = np.asarray(local_pos, dtype=float)
+        mujoco.mj_forward(self.model, self.data)
+
     def get_object_gripper_contact(self):
         """
         Return 1 if object has physical contact with hand/finger bodies.

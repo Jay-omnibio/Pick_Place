@@ -1,25 +1,27 @@
 inference:
-  # ---------- Object-relative targets ----------
-  # Format: [x, y, z] in meters, relative to EE->object frame used by observation.
-  reach_obj_rel: [-0.02, 0.00, -0.06]          # Reach target above object.
-  align_obj_rel: [-0.02, 0.00, -0.06]          # Align target before descend.
-  descend_obj_rel: [-0.01, 0.0, 0.02]        # Descend/grasp target near object top.
+  # ---------- Pick targets (object-local XY) ----------
+  # Format: [x, y, z] in object-local XY (meters), with z in world vertical relation.
+  # Runtime converts these to world-frame relation using object yaw each step.
+  # Reach/Align auto-pick +/- approach side along local X based on object side to base.
+  reach_obj_rel: [0.00, 0.00, -0.08]          # Reach target above object.
+  align_obj_rel: [0.00, 0.00, -0.06]          # Align target before descend.
+  descend_obj_rel: [0.00, 0.0, 0.02]          # Descend/grasp target near object top.
 
   # ---------- Phase gates ----------
-  approach_threshold: 0.03                  # Reach -> Align when reach error < this.
+  approach_threshold: 0.05                  # Reach -> Align when reach error < this.
   align_threshold: 0.025                    # Align considered good when error < this.
-  descend_threshold: 0.01                   # Descend norm threshold (plus axis checks).
+  descend_threshold: 0.025                   # Descend norm threshold (plus axis checks).
 
   # ---------- Phase timers ----------
   align_max_steps: 300                      # Max steps allowed in Align.
-  align_min_steps: 6                        # Min steps in Align before transition allowed.
-  pregrasp_hold_steps: 100                  # Hold duration before Descend.
-  pregrasp_hold_ready_grace_steps: 30       # Extra wait if gripper-open-ready is late.
+  align_min_steps: 3                        # Fast profile: shorter minimum align dwell.
+  pregrasp_hold_steps: 30                   # Fast profile: shorter hold before Descend.
+  pregrasp_hold_ready_grace_steps: 10       # Fast profile: shorter extra wait.
   descend_max_steps: 1000                   # Base Descend timeout budget.
 
   # ---------- Descend strict axis thresholds ----------
-  descend_x_threshold: 0.015                # Required X error for strict descend success.
-  descend_y_threshold: 0.015                # Required Y error for strict descend success.
+  descend_x_threshold: 0.01                # Required X error for strict descend success.
+  descend_y_threshold: 0.01                # Required Y error for strict descend success.
   descend_z_threshold: 0.01                 # Required Z error for strict descend success.
 
   # ---------- Descend timeout-near thresholds ----------
@@ -30,16 +32,16 @@ inference:
 
   # ---------- Descend progress watchdog ----------
   descend_progress_eps: 0.0008              # Improvement needed to count as progress.
-  descend_stall_steps: 40                   # No-progress steps before treated as stall.
-  descend_timeout_extension_steps: 40       # Extra steps granted when still improving.
+  descend_stall_steps: 300                   # No-progress steps before treated as stall.
+  descend_timeout_extension_steps: 80       # Extra steps granted when still improving.
   descend_max_timeout_extensions: 3         # Max number of timeout extensions.
 
   # ---------- Close/Lift/Test behavior ----------
-  close_hold_steps: 20                      # Close-hold dwell before lift test.
-  grasp_search_steps: 60                    # Max close-hold search before retry.
-  grasp_stable_steps_for_lift: 10           # Stable grasp steps needed to lift.
+  close_hold_steps: 12                      # Fast profile: shorter close-hold dwell.
+  grasp_search_steps: 35                    # Fast profile: shorter close-hold search window.
+  grasp_stable_steps_for_lift: 6            # Fast profile: fewer stable steps before lift.
   reach_reentry_cooldown_steps: 20          # Cooldown before re-entering Reach after retry.
-  lift_test_steps: 16                       # Lift-test duration.
+  lift_test_steps: 10                       # Fast profile: shorter lift-test duration.
   lift_test_obj_rel_drift_max: 0.06         # Max object drift during lift test.
   max_retries: 3                            # Retry cap before reset behavior.
 
@@ -65,6 +67,12 @@ inference:
   bt_set_priors_enabled: true               # Enable BT SetPrior leaf behavior (phase-aware prior assignment).
   bt_retry_reach_z_step: 0.005              # Extra reach/align height per retry (object-relative Z, meters).
   bt_retry_reach_z_max: 0.020               # Cap for retry-based reach/align extra height.
+  bt_branch_retry_cap: 2                    # Max retries per semantic recovery branch (ReScan/ReApproach/SafeBackoff).
+  bt_global_recovery_cap: 6                 # Global cap across all recoveries before terminal Failure.
+  bt_rescan_hold_steps: 40                  # Steps to keep ReScanTable prior active.
+  bt_reapproach_offset_xy: 0.01             # Local-XY offset magnitude (meters) for ReApproachOffset retries.
+  bt_safe_backoff_hold_steps: 30            # Steps to keep SafeBackoff prior active.
+  bt_safe_backoff_z_boost: 0.02             # Extra upward clearance (meters) during SafeBackoff.
 
   # ---------- VFE metrics and optional transition gating ----------
   vfe_enabled: true                         # Compute per-step VFE metrics for logs/BT supervision.
@@ -75,9 +83,17 @@ inference:
   vfe_recover_threshold: 1.50               # High-VFE threshold for BT recovery trigger.
   vfe_recover_steps: 50                     # Consecutive high-VFE steps before BT recovery.
   release_contact_warn_steps: 20            # During Open, warn if contact persists this many steps.
+  release_verify_enabled: false               # Require explicit detach + settle checks before Open->Retreat.
+  release_detach_hold_steps: 12             # Consecutive detached steps (no contact + open-ready) to confirm release.
+  release_stable_hold_steps: 10             # Consecutive stable-at-target steps required after detach.
+  release_obj_xy_threshold: 0.03            # Object-to-target XY tolerance for release verification.
+  release_obj_z_threshold: 0.03             # Object-to-target Z tolerance for release verification.
+  release_obj_speed_threshold: 0.06          # Object speed (m/s) threshold to consider placed object stable.
+  open_max_steps: 160                       # Hard timeout for Open phase before release-failure recovery.
+  release_reapproach_max_retries: 2         # Max release re-approach attempts before terminal Failure.
 
   # ---------- Risk detection (detect-only, no forced recovery) ----------
-  risk_detection_enabled: true              # Enable singularity/collision-like risk flags in logs.
+  risk_detection_enabled: false              # Enable singularity/collision-like risk flags in logs.
   singularity_dq_ratio_threshold: 5.0       # dq_raw/dq_applied ratio threshold for singularity risk.
   singularity_no_progress_steps: 30         # Consecutive steps before singularity warning.
   unintended_contact_warn_steps: 12         # Consecutive unexpected-contact steps before warning.
@@ -87,51 +103,64 @@ inference:
   reach_arc_release_deg: 20.0               # Release turn lock when angular gap drops below this.
   reach_progress_eps: 0.002                 # Reach improvement epsilon for stall tracking.
   reach_stall_steps: 300                     # No-progress steps before watchdog fallback.
-  reach_yaw_align_xy_enter: 0.20            # Enter yaw-align hold when XY error < this.
-  reach_yaw_align_steps: 100                # Number of yaw-align hold steps.
+  reach_yaw_align_xy_enter: 0.020            # Enter yaw-align hold when XY error < this.
+  reach_yaw_align_steps: 30                 # Fast profile: shorter yaw-align hold.
   grip_close_ready_max_width: 0.035         # Width threshold to consider close-ready with contact.
 
   # ---------- Post-lift placement pipeline ----------
-  preplace_target_rel: [0.01, 0.01, -0.08]  # MoveToPlaceAbove goal in EE->target frame.
-  place_target_rel: [0.001, 0.001, 0.0]     # DescendToPlace goal in EE->target frame.
+  # World goal pose source:
+  # - Place goal XYZ/Yaw is loaded from common.task_shared in common_robot.yaml.
+  # - AI config keeps only placement behavior/gating parameters.
+  place_goal_yaw_enabled: true
+  place_goal_yaw_threshold_deg: 12.0
+  place_goal_yaw_pi_symmetric: true
+  preplace_target_rel: [0.0, 0.0, -0.06]  # MoveToPlaceAbove goal in EE->target frame.
+  place_target_rel: [0.0, 0.00, -0.01]     # DescendToPlace goal in EE->target frame.
   preplace_threshold: 0.04                  # Norm threshold for MoveToPlaceAbove completion.
   place_threshold: 0.03                     # Norm threshold for DescendToPlace completion.
   preplace_xy_threshold: 0.02               # XY threshold for MoveToPlaceAbove.
   preplace_z_threshold: 0.03                # Z threshold for MoveToPlaceAbove.
-  place_xy_threshold: 0.025                  # XY threshold for DescendToPlace.
-  place_z_threshold: 0.015                   # Z threshold for DescendToPlace.
+  place_xy_threshold: 0.020                  # XY threshold for DescendToPlace.
+  place_z_threshold: 0.015                  # Z threshold for DescendToPlace.
+  place_descend_max_steps: 500              # Max steps for DescendToPlace before re-approach/failure handling.
+  place_descend_progress_eps: 0.0008        # Improvement epsilon used by place descend stall watchdog.
+  place_descend_stall_steps: 160            # No-progress steps considered stalled in DescendToPlace.
+  place_descend_timeout_extension_steps: 30 # Extra steps granted when still improving near timeout.
+  place_descend_max_timeout_extensions: 2   # Max timeout extensions in DescendToPlace.
+  place_reapproach_max_retries: 2           # Max MoveToPlaceAbove->DescendToPlace re-approaches before Failure.
   transit_height: 0.35                      # Safe height before moving to place.
   transit_z_threshold: 0.02                 # Transit completion tolerance on Z.
-  open_hold_steps: 80                       # Hold-open duration before retreat.
+  open_hold_steps: 35                       # Fast profile: shorter hold-open duration.
   retreat_steps: 24                         # Retreat duration before Done.
-  retreat_move: [-0.012, 0.0, 0.10]         # Retreat motion direction (normalized in policy).
+  retreat_move: [0.0, 0.0, 0.08]          # Retreat motion direction in world-Z (positive = up).
 
 action_selection:
   # ---------- Expected Free Energy / prediction ----------
-  lambda_epistemic: 0.25  # 0.1 changed                   # Epistemic weight in EFE.
-  delta: 0.022                              # Generic step for fallback EFE scan.
-  reach_delta: 0.026                        # Max cartesian step in Reach.
-  action_effectiveness: 0.4                 # Belief dynamics coupling factor.
+  lambda_epistemic: 0.35  # 0.1 changed                   # Epistemic weight in EFE.
+  delta: 0.030                              # Fast profile: larger fallback move step.
+  reach_delta: 0.042                        # Fast profile: larger Reach cartesian step.
+  action_effectiveness: 0.3   #changed 0.4              # Belief dynamics coupling factor.
 
   # ---------- Reach XY/Z blending ----------
-  reach_axis_threshold_x: 0.03              # X normalization for Reach axis-priority.
-  reach_axis_threshold_y: 0.03              # Y normalization for Reach axis-priority.
-  reach_z_blend_start: 0.06                 # Start adding Z when XY max error drops below this.
+  reach_axis_threshold_x: 0.015              # X normalization for Reach axis-priority.
+  reach_axis_threshold_y: 0.015            # Y normalization for Reach axis-priority.
+  reach_z_blend_start: 0.06 #changed 0.06                 # Start adding Z when XY max error drops below this.
   reach_z_blend_full: 0.005  #0.02 changed               # Full Z when XY max error drops below this.
-  reach_step_min: 0.008                     # Reach minimum step floor.
+  reach_step_min: 0.014                     # Fast profile: higher Reach step floor.
 
   # ---------- Reach arc/spiral ----------
   reach_arc_enabled: true                   # Enable arc mode when turn-lock is active.
   reach_arc_max_theta_step_deg: 12.0        # Max angular step per control step.
   reach_arc_radial_step_max: 0.03           # Max radial change per control step.
-  reach_arc_min_radius: 0                   # Minimum allowed radius in arc mode.
+  reach_arc_min_radius: 0.12                   # Minimum allowed radius in arc mode.
   reach_arc_max_radius: 0.78                # Maximum allowed radius in arc mode.
 
   # ---------- Phase-local step caps ----------
-  grasp_step: 0.010                         # Max step in Descend/grasp approach.
-  align_step: 0.012                         # Max step in Align.
-  pregrasp_hold_step: 0.006                 # Max correction step in PreGraspHold.
+  grasp_step: 0.018                         # Fast profile: larger Descend/grasp step.
+  align_step: 0.020                         # Fast profile: larger Align step.
+  pregrasp_hold_step: 0.012                 # Fast profile: larger PreGraspHold correction.
   confidence_speed_scaling_enabled: true    # Scale Reach/Descend step size by observation confidence.
-  confidence_speed_min_scale: 0.40          # Minimum speed scale when confidence is low.
+  confidence_speed_min_scale: 0.65          # Fast profile: less slowdown at low confidence.
   reach_confidence_speed_power: 1.0         # Reach scale uses confidence^power.
-  descend_confidence_speed_power: 1.5       # Descend scale uses confidence^power (higher => more cautious).
+  descend_confidence_speed_power: 1.1       # Fast profile: less cautious descend slowdown.
+  place_goal_gripper_yaw_offset_deg: 90.0   # Gripper yaw offset from desired object yaw during place phases.

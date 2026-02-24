@@ -1,19 +1,28 @@
 run:
-  control_mode: active_inference # active_inference
+  control_mode: active_inference # active_inference or fsm
   log_every_steps: 100
 
+task_shared:
+  # Shared place-goal pose used by both FSM and Active Inference.
+  # - target_world_xyz drives simulator target site (red marker).
+  # - target_world_yaw_deg is used by AI place yaw logic.
+  # Optional full pose overrides xyz+yaw when provided.
+  target_world_xyz: [0.60, 0.20, 0.02]
+  target_world_yaw_deg: 0.0
+  target_world_pose6d_deg: [0.60, 0.20, 0.02, 0.0, 0.0, 0.0]
+
 controller:
-  max_step: 0.05  # 0.03 changed
+  max_step: 0.050  # fast profile: larger cartesian step per control cycle
   min_height: 0.02
   max_target_radius: 0.78 
   ik_damping: 0.03
   nullspace_gain: 0.10 #0.15 changed
   nullspace_gain_grasp: 0.05
-  max_joint_step: 0.20
-  ee_tolerance: 0.0001
-  move_smoothing: 0.35  # 0.55 changed
+  max_joint_step: 0.30
+  ee_tolerance: 0.0001 # mean position error tolerance for success
+  move_smoothing: 0.30  # lower smoothing for faster response
   yaw_target: 3
-  yaw_weight: 0.25
+  yaw_weight: 0.25 
   yaw_weight_grasp: 1.0
   enable_yaw_objective: true
   yaw_axis: 1
@@ -23,7 +32,7 @@ controller:
   tool_axis: 2
   gripper_open_width: 0.060
   gripper_close_width: 0.0
-  gripper_rate: 0.03
+  gripper_rate: 0.045
   gripper_width_tol: 0.0015
   gripper_speed_tol: 0.002
   gripper_switch_cooldown_steps: 6

@@ -5,16 +5,16 @@
 ee_sensor:
   # Proprioceptive EE position sensor
   # High precision (low noise)
-  noise_std: 0.002        # meters
+  noise_std: 0.002  # changed 0.002      # meters
 
 object_sensor:
   # Vision-like object-relative sensor
   # Lower precision (more uncertainty)
-  noise_std: 0.02         # meters
+  noise_std: 0.02  # changed 0.02       # meters
 
 target_sensor:
   # Place-target observation (relative to EE)
-  noise_std: 0.02         # meters
+  noise_std: 0.02       #changed 0.02 # meters
 
 gripper_sensor:
   # Encoder noise is negligible for now

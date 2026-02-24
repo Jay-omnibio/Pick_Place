@@ -28,6 +28,75 @@ def _wrap_to_pi(angle: float) -> float:
     return float((float(angle) + np.pi) % (2.0 * np.pi) - np.pi)
 
 
+def _yaw_error(current_yaw: float, desired_yaw: float, pi_symmetric: bool = False) -> float:
+    e0 = _wrap_to_pi(float(desired_yaw) - float(current_yaw))
+    if not bool(pi_symmetric):
+        return float(e0)
+    e1 = _wrap_to_pi(float(desired_yaw + np.pi) - float(current_yaw))
+    e2 = _wrap_to_pi(float(desired_yaw - np.pi) - float(current_yaw))
+    return float(min((e0, e1, e2), key=lambda x: abs(float(x))))
+
+
+def _safe_scalar(value, default: float = 0.0) -> float:
+    try:
+        arr = np.asarray(value, dtype=float).reshape(-1)
+        if arr.size > 0 and np.isfinite(arr[0]):
+            return float(arr[0])
+    except (TypeError, ValueError):
+        pass
+    return float(default)
+
+
+def _safe_vec3(value, default=None) -> np.ndarray:
+    if default is None:
+        default = np.zeros(3, dtype=float)
+    try:
+        arr = np.asarray(value, dtype=float).reshape(-1)
+        if arr.shape[0] >= 3 and np.all(np.isfinite(arr[:3])):
+            return arr[:3].astype(float).copy()
+    except (TypeError, ValueError):
+        pass
+    return np.asarray(default, dtype=float).reshape(3).copy()
+
+
+def _obj_local_rel_to_world(rel_local: np.ndarray, obj_yaw: float) -> np.ndarray:
+    """
+    Convert object-local XY relation into world-frame XY relation.
+    Z stays unchanged (world vertical).
+    """
+    r = np.asarray(rel_local, dtype=float).copy().reshape(3)
+    c = float(np.cos(float(obj_yaw)))
+    s = float(np.sin(float(obj_yaw)))
+    x_l = float(r[0])
+    y_l = float(r[1])
+    r[0] = c * x_l - s * y_l
+    r[1] = s * x_l + c * y_l
+    return r
+
+
+def _compute_approach_side_sign(
+    s_ee_mean: np.ndarray,
+    s_obj_mean: np.ndarray,
+    obj_yaw: float,
+    prev_sign: float,
+) -> float:
+    """
+    Pick a stable +/- side for pregrasp approach along object local +X axis.
+    The sign is chosen relative to robot base (origin) and held near boundary.
+    """
+    c = float(np.cos(float(obj_yaw)))
+    s = float(np.sin(float(obj_yaw)))
+    approach_axis_world = np.asarray([c, s], dtype=float)  # local +X in world XY
+    obj_world_xy = np.asarray(s_ee_mean[:2], dtype=float) + np.asarray(s_obj_mean[:2], dtype=float)
+    score = float(np.dot(obj_world_xy, approach_axis_world))
+    deadband = 0.015
+    if score > deadband:
+        return 1.0
+    if score < -deadband:
+        return -1.0
+    return 1.0 if float(prev_sign) >= 0.0 else -1.0
+
+
 def _compute_phase_vfe(
     phase: str,
     s_ee_mean: np.ndarray,
@@ -82,9 +151,11 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     """
 
     params = params or {}
-    reach_obj_rel = _require_vec3(params, "reach_obj_rel")
-    align_obj_rel = _require_vec3(params, "align_obj_rel")
-    descend_obj_rel = _require_vec3(params, "descend_obj_rel")
+    # Pick-side references are configured in object-local XY and converted
+    # per-step to world-frame relation using current object yaw.
+    reach_obj_rel_local_cfg = _require_vec3(params, "reach_obj_rel")
+    align_obj_rel_local_cfg = _require_vec3(params, "align_obj_rel")
+    descend_obj_rel_local_cfg = _require_vec3(params, "descend_obj_rel")
 
     approach_threshold = float(_require_param(params, "approach_threshold"))
     align_threshold = float(_require_param(params, "align_threshold"))
@@ -134,10 +205,25 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     vfe_recover_enabled = bool(_require_param(params, "vfe_recover_enabled"))
     vfe_recover_threshold = float(_require_param(params, "vfe_recover_threshold"))
     vfe_recover_steps = int(_require_param(params, "vfe_recover_steps"))
+    bt_branch_retry_cap = int(_require_param(params, "bt_branch_retry_cap"))
+    bt_global_recovery_cap = int(_require_param(params, "bt_global_recovery_cap"))
+    bt_rescan_hold_steps = int(_require_param(params, "bt_rescan_hold_steps"))
+    bt_reapproach_offset_xy = float(_require_param(params, "bt_reapproach_offset_xy"))
+    bt_safe_backoff_hold_steps = int(_require_param(params, "bt_safe_backoff_hold_steps"))
+    bt_safe_backoff_z_boost = float(_require_param(params, "bt_safe_backoff_z_boost"))
     release_contact_warn_steps = int(_require_param(params, "release_contact_warn_steps"))
+    release_verify_enabled = bool(_require_param(params, "release_verify_enabled"))
+    release_detach_hold_steps = int(_require_param(params, "release_detach_hold_steps"))
+    release_stable_hold_steps = int(_require_param(params, "release_stable_hold_steps"))
+    release_obj_xy_threshold = float(_require_param(params, "release_obj_xy_threshold"))
+    release_obj_z_threshold = float(_require_param(params, "release_obj_z_threshold"))
+    release_obj_speed_threshold = float(_require_param(params, "release_obj_speed_threshold"))
+    open_max_steps = int(_require_param(params, "open_max_steps"))
+    release_reapproach_max_retries = int(_require_param(params, "release_reapproach_max_retries"))
 
     reach_arc_angle_trigger_deg = float(_require_param(params, "reach_arc_angle_trigger_deg"))
     reach_arc_release_deg = float(_require_param(params, "reach_arc_release_deg"))
+    reach_arc_min_radius = float(_require_param(params, "reach_arc_min_radius"))
     reach_progress_eps = float(_require_param(params, "reach_progress_eps"))
     reach_stall_steps = int(_require_param(params, "reach_stall_steps"))
     reach_yaw_align_xy_enter = float(_require_param(params, "reach_yaw_align_xy_enter"))
@@ -145,12 +231,46 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     grip_close_ready_max_width = float(_require_param(params, "grip_close_ready_max_width"))
     preplace_target_rel = _require_vec3(params, "preplace_target_rel")
     place_target_rel = _require_vec3(params, "place_target_rel")
+    use_world_place_goal_pose = bool(_require_param(params, "use_world_place_goal_pose"))
+    place_goal_world_xyz = _require_vec3(params, "place_goal_world_xyz")
+    place_goal_world_yaw = float(np.deg2rad(float(_require_param(params, "place_goal_world_yaw_deg"))))
+    place_goal_yaw_enabled = bool(_require_param(params, "place_goal_yaw_enabled"))
+    place_goal_yaw_threshold = float(
+        np.deg2rad(float(_require_param(params, "place_goal_yaw_threshold_deg")))
+    )
+    place_goal_yaw_pi_symmetric = bool(_require_param(params, "place_goal_yaw_pi_symmetric"))
+    place_goal_world_pose6d_deg = None
+    place_goal_world_pose6d_deg_raw = params.get("place_goal_world_pose6d_deg", None)
+    if place_goal_world_pose6d_deg_raw is not None:
+        pose6 = np.asarray(place_goal_world_pose6d_deg_raw, dtype=float).reshape(-1)
+        if pose6.shape[0] != 6:
+            raise ValueError(
+                "Active-inference config key 'place_goal_world_pose6d_deg' must be length-6 "
+                "[x,y,z,roll_deg,pitch_deg,yaw_deg]."
+            )
+        if not np.all(np.isfinite(pose6)):
+            raise ValueError(
+                "Active-inference config key 'place_goal_world_pose6d_deg' must contain finite values."
+            )
+        place_goal_world_pose6d_deg = pose6.copy()
+        place_goal_world_xyz = pose6[:3].copy()
+        place_goal_world_yaw = float(np.deg2rad(float(pose6[5])))
     preplace_threshold = float(_require_param(params, "preplace_threshold"))
     place_threshold = float(_require_param(params, "place_threshold"))
     preplace_xy_threshold = float(_require_param(params, "preplace_xy_threshold"))
     preplace_z_threshold = float(_require_param(params, "preplace_z_threshold"))
     place_xy_threshold = float(_require_param(params, "place_xy_threshold"))
     place_z_threshold = float(_require_param(params, "place_z_threshold"))
+    place_descend_max_steps = int(_require_param(params, "place_descend_max_steps"))
+    place_descend_progress_eps = float(_require_param(params, "place_descend_progress_eps"))
+    place_descend_stall_steps = int(_require_param(params, "place_descend_stall_steps"))
+    place_descend_timeout_extension_steps = int(
+        _require_param(params, "place_descend_timeout_extension_steps")
+    )
+    place_descend_max_timeout_extensions = int(
+        _require_param(params, "place_descend_max_timeout_extensions")
+    )
+    place_reapproach_max_retries = int(_require_param(params, "place_reapproach_max_retries"))
     transit_height = float(_require_param(params, "transit_height"))
     transit_z_threshold = float(_require_param(params, "transit_z_threshold"))
     open_hold_steps = int(_require_param(params, "open_hold_steps"))
@@ -164,14 +284,41 @@ def infer_beliefs(observation, previous_belief=None, params=None):
 
     # Initial belief (t = 0)
     if previous_belief is None:
+        init_s_ee_mean = _safe_vec3(observation.get("o_ee", [0.0, 0.0, 0.0]))
+        init_s_obj_mean = _safe_vec3(observation.get("o_obj", [0.0, 0.0, 0.0]))
+        if use_world_place_goal_pose:
+            init_s_target_mean = np.asarray(place_goal_world_xyz, dtype=float) - np.asarray(
+                init_s_ee_mean, dtype=float
+            )
+        else:
+            init_s_target_mean = _safe_vec3(observation.get("o_target", [0.0, 0.0, 0.0]))
+        init_obj_yaw = float(observation.get("o_obj_yaw", 0.0))
+        if not np.isfinite(init_obj_yaw):
+            init_obj_yaw = 0.0
+        init_approach_side_sign = _compute_approach_side_sign(
+            s_ee_mean=init_s_ee_mean,
+            s_obj_mean=init_s_obj_mean,
+            obj_yaw=init_obj_yaw,
+            prev_sign=1.0,
+        )
+        reach_local_signed = reach_obj_rel_local_cfg.copy()
+        align_local_signed = align_obj_rel_local_cfg.copy()
+        reach_local_signed[0] = abs(float(reach_local_signed[0])) * init_approach_side_sign
+        align_local_signed[0] = abs(float(align_local_signed[0])) * init_approach_side_sign
+        descend_local = descend_obj_rel_local_cfg.copy()
+
+        reach_obj_rel = _obj_local_rel_to_world(reach_local_signed, init_obj_yaw)
+        align_obj_rel = _obj_local_rel_to_world(align_local_signed, init_obj_yaw)
+        descend_obj_rel = _obj_local_rel_to_world(descend_local, init_obj_yaw)
+
         init_s_ee_cov = np.eye(3) * 0.05
         init_s_obj_cov = np.eye(3) * 0.1
         init_s_target_cov = np.eye(3) * 0.1
         init_vfe_total, init_vfe_pragmatic, init_vfe_epistemic = _compute_phase_vfe(
             phase="Reach",
-            s_ee_mean=observation["o_ee"],
-            s_obj_mean=observation["o_obj"],
-            s_target_mean=observation["o_target"],
+            s_ee_mean=init_s_ee_mean,
+            s_obj_mean=init_s_obj_mean,
+            s_target_mean=init_s_target_mean,
             s_obj_cov=init_s_obj_cov,
             s_target_cov=init_s_target_cov,
             reach_obj_rel=reach_obj_rel,
@@ -183,18 +330,42 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             vfe_epistemic_weight=vfe_epistemic_weight,
         )
         return {
-            "s_ee_mean": observation["o_ee"].copy(),
-            "s_obj_mean": observation["o_obj"].copy(),
-            "s_target_mean": observation["o_target"].copy(),
+            "s_ee_mean": init_s_ee_mean.copy(),
+            "s_obj_mean": init_s_obj_mean.copy(),
+            "s_target_mean": init_s_target_mean.copy(),
             "s_ee_cov": init_s_ee_cov,
             "s_obj_cov": init_s_obj_cov,
             "s_target_cov": init_s_target_cov,
-            "s_obj_yaw": float(observation.get("o_obj_yaw", 0.0)),
+            "s_obj_yaw": init_obj_yaw,
+            "reach_obj_rel_local": reach_obj_rel_local_cfg.copy(),
+            "align_obj_rel_local": align_obj_rel_local_cfg.copy(),
+            "descend_obj_rel_local": descend_obj_rel_local_cfg.copy(),
+            "approach_side_sign": float(init_approach_side_sign),
             "reach_obj_rel": reach_obj_rel.copy(),
             "align_obj_rel": align_obj_rel.copy(),
             "descend_obj_rel": descend_obj_rel.copy(),
             "preplace_target_rel": preplace_target_rel.copy(),
             "place_target_rel": place_target_rel.copy(),
+            "use_world_place_goal_pose": int(use_world_place_goal_pose),
+            "place_goal_world_xyz": np.asarray(place_goal_world_xyz, dtype=float).copy(),
+            "place_goal_world_pose6d_deg": (
+                None
+                if place_goal_world_pose6d_deg is None
+                else np.asarray(place_goal_world_pose6d_deg, dtype=float).copy()
+            ),
+            "place_goal_yaw": float(place_goal_world_yaw),
+            "place_goal_yaw_enabled": int(place_goal_yaw_enabled),
+            "place_goal_yaw_threshold": float(place_goal_yaw_threshold),
+            "place_goal_yaw_pi_symmetric": int(place_goal_yaw_pi_symmetric),
+            "place_goal_yaw_error": float(
+                abs(
+                    _yaw_error(
+                        current_yaw=init_obj_yaw,
+                        desired_yaw=place_goal_world_yaw,
+                        pi_symmetric=place_goal_yaw_pi_symmetric,
+                    )
+                )
+            ),
             "retreat_move": retreat_move.copy(),
             "s_grasp": 0,   # Open
             "phase": "Reach",
@@ -212,10 +383,18 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "reach_yaw_align_active": 0,
             "reach_yaw_align_timer": 0,
             "reach_yaw_align_done": 0,
-            "prev_o_grip": float(observation["o_grip"]),
-            "prev_o_contact": int(observation["o_contact"]),
-            "prev_o_obj": observation["o_obj"].copy(),
-            "prev_o_target": observation["o_target"].copy(),
+            "reach_gate_active": 0,
+            "reach_gate_counter": 0,
+            "align_gate_active": 0,
+            "align_gate_counter": 0,
+            "pregrasp_ready_counter": 0,
+            "descend_gate_active": 0,
+            "descend_gate_counter": 0,
+            "descend_yaw_enabled": 0,
+            "prev_o_grip": _safe_scalar(observation.get("o_grip", 0.0), default=0.0),
+            "prev_o_contact": int(_safe_scalar(observation.get("o_contact", 0), default=0)),
+            "prev_o_obj": init_s_obj_mean.copy(),
+            "prev_o_target": init_s_target_mean.copy(),
             "obs_confidence": 1.0,
             "phase_conf_ok": 1,
             "phase_vfe_ok": 1,
@@ -239,31 +418,87 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "retreat_timer": 0,
             "release_contact_counter": 0,
             "release_warning": 0,
+            "release_detach_counter": 0,
+            "release_stable_counter": 0,
+            "release_reapproach_count": 0,
+            "place_descend_timer": 0,
+            "place_descend_best_error": float("inf"),
+            "place_descend_no_progress_steps": 0,
+            "place_descend_timeout_extensions": 0,
+            "place_reapproach_count": 0,
+            "recovery_branch": "",
+            "recovery_branch_retry": 0,
+            "recovery_global_count": 0,
+            "bt_branch_retry_cap": int(bt_branch_retry_cap),
+            "bt_global_recovery_cap": int(bt_global_recovery_cap),
+            "bt_rescan_hold_steps": int(bt_rescan_hold_steps),
+            "bt_reapproach_offset_xy": float(bt_reapproach_offset_xy),
+            "bt_safe_backoff_hold_steps": int(bt_safe_backoff_hold_steps),
+            "bt_safe_backoff_z_boost": float(bt_safe_backoff_z_boost),
             "retry_count": 0,
+            "last_retry_reason": "",
+            "failure_reason": "",
         }
 
+    reach_obj_rel_local = reach_obj_rel_local_cfg.copy()
+    align_obj_rel_local = align_obj_rel_local_cfg.copy()
+    descend_obj_rel_local = descend_obj_rel_local_cfg.copy()
     if allow_bt_prior_override:
-        def _maybe_override_ref(key: str, current: np.ndarray) -> np.ndarray:
-            if key not in previous_belief:
-                return current
-            candidate = np.asarray(previous_belief.get(key), dtype=float).reshape(-1)
-            if candidate.shape[0] == 3 and np.all(np.isfinite(candidate)):
-                return candidate.copy()
+        def _maybe_override_ref(keys, current: np.ndarray) -> np.ndarray:
+            for key in keys:
+                if key not in previous_belief:
+                    continue
+                candidate = np.asarray(previous_belief.get(key), dtype=float).reshape(-1)
+                if candidate.shape[0] == 3 and np.all(np.isfinite(candidate)):
+                    return candidate.copy()
             return current
 
-        reach_obj_rel = _maybe_override_ref("reach_obj_rel", reach_obj_rel)
-        align_obj_rel = _maybe_override_ref("align_obj_rel", align_obj_rel)
-        descend_obj_rel = _maybe_override_ref("descend_obj_rel", descend_obj_rel)
-        preplace_target_rel = _maybe_override_ref("preplace_target_rel", preplace_target_rel)
-        place_target_rel = _maybe_override_ref("place_target_rel", place_target_rel)
-        retreat_move = _maybe_override_ref("retreat_move", retreat_move)
+        # Backward-compatible lookup: prefer *_local keys, then legacy key names.
+        reach_obj_rel_local = _maybe_override_ref(
+            ["reach_obj_rel_local", "reach_obj_rel"], reach_obj_rel_local
+        )
+        align_obj_rel_local = _maybe_override_ref(
+            ["align_obj_rel_local", "align_obj_rel"], align_obj_rel_local
+        )
+        descend_obj_rel_local = _maybe_override_ref(
+            ["descend_obj_rel_local", "descend_obj_rel"], descend_obj_rel_local
+        )
+        preplace_target_rel = _maybe_override_ref(["preplace_target_rel"], preplace_target_rel)
+        place_target_rel = _maybe_override_ref(["place_target_rel"], place_target_rel)
+        retreat_move = _maybe_override_ref(["retreat_move"], retreat_move)
 
     # Placeholder inference update (to be replaced by RxInfer call)
-    s_ee_mean = alpha_ee * observation["o_ee"] + (1 - alpha_ee) * previous_belief["s_ee_mean"]
+    # Use estimator outputs + short-horizon prediction to reduce sensing lag.
+    ee_obs = _safe_vec3(observation.get("o_ee", [0.0, 0.0, 0.0]))
+    obj_obs_raw = _safe_vec3(observation.get("o_obj", [0.0, 0.0, 0.0]))
+    if use_world_place_goal_pose:
+        # Planner-provided world goal pose is treated as the canonical place target.
+        # Convert to relative EE->target relation used by existing place pipeline.
+        target_obs_raw = np.asarray(place_goal_world_xyz, dtype=float) - np.asarray(ee_obs, dtype=float)
+    else:
+        target_obs_raw = _safe_vec3(observation.get("o_target", [0.0, 0.0, 0.0]))
+    obj_est = _safe_vec3(observation.get("o_obj_est", obj_obs_raw), default=obj_obs_raw)
+    target_est = _safe_vec3(observation.get("o_target_est", target_obs_raw), default=target_obs_raw)
+    obj_vel = _safe_vec3(observation.get("o_obj_vel", [0.0, 0.0, 0.0]))
+    ee_vel = _safe_vec3(observation.get("o_ee_vel", [0.0, 0.0, 0.0]))
+    if use_world_place_goal_pose:
+        target_vel = np.zeros(3, dtype=float)
+    else:
+        target_vel = _safe_vec3(observation.get("o_target_vel", [0.0, 0.0, 0.0]))
+    obs_dt = _safe_scalar(observation.get("o_dt", 0.0), default=0.0)
+    predict_horizon = float(np.clip(obs_dt, 0.0, 0.04))
+
+    obj_obs = obj_est + obj_vel * predict_horizon
+    if not np.all(np.isfinite(obj_obs)):
+        obj_obs = obj_est.copy()
+    target_obs = target_est + target_vel * predict_horizon
+    if not np.all(np.isfinite(target_obs)):
+        target_obs = target_est.copy()
+
+    s_ee_mean = alpha_ee * ee_obs + (1 - alpha_ee) * previous_belief["s_ee_mean"]
 
     prev_phase = previous_belief["phase"]
-    prev_obj = previous_belief["s_obj_mean"]
-    obj_obs = observation["o_obj"]
+    prev_obj = np.asarray(previous_belief["s_obj_mean"], dtype=float).reshape(3)
     obj_yaw_obs = float(observation.get("o_obj_yaw", 0.0))
     if not np.isfinite(obj_yaw_obs):
         obj_yaw_obs = 0.0
@@ -274,18 +509,36 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         alpha_obj = max(alpha_obj, 0.95)
     s_obj_mean = alpha_obj * obj_obs + (1 - alpha_obj) * prev_obj
     s_target_mean = (
-        alpha_target * observation["o_target"] + (1 - alpha_target) * previous_belief["s_target_mean"]
+        alpha_target * target_obs + (1 - alpha_target) * previous_belief["s_target_mean"]
     )
+    prev_approach_side_sign = float(previous_belief.get("approach_side_sign", 1.0))
+    approach_side_sign = _compute_approach_side_sign(
+        s_ee_mean=np.asarray(s_ee_mean, dtype=float),
+        s_obj_mean=np.asarray(s_obj_mean, dtype=float),
+        obj_yaw=obj_yaw_obs,
+        prev_sign=prev_approach_side_sign,
+    )
+    # Reach/Align use dynamic side sign (toward safer base-facing side).
+    reach_local_signed = reach_obj_rel_local.copy()
+    align_local_signed = align_obj_rel_local.copy()
+    reach_local_signed[0] = abs(float(reach_local_signed[0])) * approach_side_sign
+    align_local_signed[0] = abs(float(align_local_signed[0])) * approach_side_sign
+    # Descend keeps configured local relation (typically near-centered XY).
+    descend_local = descend_obj_rel_local.copy()
+
+    reach_obj_rel = _obj_local_rel_to_world(reach_local_signed, obj_yaw_obs)
+    align_obj_rel = _obj_local_rel_to_world(align_local_signed, obj_yaw_obs)
+    descend_obj_rel = _obj_local_rel_to_world(descend_local, obj_yaw_obs)
     s_obj_cov = previous_belief["s_obj_cov"]
     s_target_cov = previous_belief["s_target_cov"]
     prev_o_obj = np.asarray(previous_belief.get("prev_o_obj", obj_obs), dtype=float)
     prev_o_target = np.asarray(
-        previous_belief.get("prev_o_target", observation["o_target"]),
+        previous_belief.get("prev_o_target", target_obs),
         dtype=float,
     )
-    prev_o_contact = int(previous_belief.get("prev_o_contact", observation["o_contact"]))
+    prev_o_contact = int(previous_belief.get("prev_o_contact", int(observation["o_contact"])))
     obj_obs_jump = float(np.linalg.norm(obj_obs - prev_o_obj))
-    target_obs_jump = float(np.linalg.norm(observation["o_target"] - prev_o_target))
+    target_obs_jump = float(np.linalg.norm(target_obs - prev_o_target))
     contact_flipped = int(int(observation["o_contact"]) != prev_o_contact)
 
     if confidence_enabled:
@@ -324,6 +577,18 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     )
     phase_vfe_ok = (not vfe_phase_change_enabled) or (vfe_total <= vfe_phase_change_max)
     phase_gate_ok = bool(phase_conf_ok and phase_vfe_ok)
+    place_yaw_error = float(
+        abs(
+            _yaw_error(
+                current_yaw=obj_yaw_obs,
+                desired_yaw=place_goal_world_yaw,
+                pi_symmetric=place_goal_yaw_pi_symmetric,
+            )
+        )
+    )
+    place_yaw_ok = (not place_goal_yaw_enabled) or (
+        place_yaw_error <= place_goal_yaw_threshold
+    )
 
     # Contact hysteresis to avoid sticky/latched grasp state.
     contact_counter = previous_belief.get("contact_counter", 0)
@@ -367,6 +632,27 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     retreat_timer = int(previous_belief.get("retreat_timer", 0))
     release_contact_counter = int(previous_belief.get("release_contact_counter", 0))
     release_warning = int(previous_belief.get("release_warning", 0))
+    release_detach_counter = int(previous_belief.get("release_detach_counter", 0))
+    release_stable_counter = int(previous_belief.get("release_stable_counter", 0))
+    release_reapproach_count = int(previous_belief.get("release_reapproach_count", 0))
+    reach_gate_active = int(previous_belief.get("reach_gate_active", 0))
+    reach_gate_counter = int(previous_belief.get("reach_gate_counter", 0))
+    align_gate_active = int(previous_belief.get("align_gate_active", 0))
+    align_gate_counter = int(previous_belief.get("align_gate_counter", 0))
+    pregrasp_ready_counter = int(previous_belief.get("pregrasp_ready_counter", 0))
+    descend_gate_active = int(previous_belief.get("descend_gate_active", 0))
+    descend_gate_counter = int(previous_belief.get("descend_gate_counter", 0))
+    descend_yaw_enabled = int(previous_belief.get("descend_yaw_enabled", 0))
+    place_descend_timer = int(previous_belief.get("place_descend_timer", 0))
+    place_descend_best_error = float(previous_belief.get("place_descend_best_error", float("inf")))
+    place_descend_no_progress_steps = int(previous_belief.get("place_descend_no_progress_steps", 0))
+    place_descend_timeout_extensions = int(previous_belief.get("place_descend_timeout_extensions", 0))
+    place_reapproach_count = int(previous_belief.get("place_reapproach_count", 0))
+    recovery_branch = str(previous_belief.get("recovery_branch", ""))
+    recovery_branch_retry = int(previous_belief.get("recovery_branch_retry", 0))
+    recovery_global_count = int(previous_belief.get("recovery_global_count", 0))
+    last_retry_reason = str(previous_belief.get("last_retry_reason", ""))
+    failure_reason = str(previous_belief.get("failure_reason", ""))
     lift_test_ref_obj_rel = np.array(
         previous_belief.get("lift_test_ref_obj_rel", s_obj_mean.copy()), dtype=float
     )
@@ -374,6 +660,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     reach_error = np.linalg.norm(s_obj_mean - reach_obj_rel)
     prev_o_grip = float(previous_belief.get("prev_o_grip", observation["o_grip"]))
     grip_obs = float(observation["o_grip"])
+    contact_obs = int(observation["o_contact"])
     grip_speed = abs(grip_obs - prev_o_grip)
     gripper_open_ready = (
         abs(grip_obs - grip_open_target) <= grip_ready_width_tol and grip_speed <= grip_ready_speed_tol
@@ -387,8 +674,29 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     )
     if reach_cooldown > 0:
         reach_cooldown -= 1
+    if phase != "Failure":
+        failure_reason = ""
+
+    # Hysteresis/debounce gates to reduce threshold chatter around phase transitions.
+    reach_enter_threshold = float(approach_threshold)
+    reach_exit_threshold = float(max(approach_threshold * 1.35, approach_threshold + 0.005))
+    align_enter_threshold = float(align_threshold)
+    align_exit_threshold = float(max(align_threshold * 1.35, align_threshold + 0.004))
+    descend_exit_x_threshold = float(max(descend_x_threshold * 1.40, descend_x_threshold + 0.004))
+    descend_exit_y_threshold = float(max(descend_y_threshold * 1.40, descend_y_threshold + 0.004))
+    descend_exit_z_threshold = float(max(descend_z_threshold * 1.40, descend_z_threshold + 0.004))
+    reach_gate_stable_steps = 3
+    align_gate_stable_steps = 2
+    descend_gate_stable_steps = 3
+    pregrasp_ready_steps = 4
 
     if phase == "Reach":
+        if reach_gate_active == 1:
+            reach_gate_active = int(reach_error <= reach_exit_threshold)
+        else:
+            reach_gate_active = int(reach_error <= reach_enter_threshold)
+        reach_gate_counter = (reach_gate_counter + 1) if reach_gate_active == 1 else 0
+
         # Reach arc direction lock (for side/behind objects): pick CW/CCW once and hold.
         reach_err_vec = s_obj_mean - reach_obj_rel
         xy_err = float(np.linalg.norm(reach_err_vec[:2]))
@@ -407,7 +715,8 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         goal_xy = np.asarray(s_ee_mean[:2] + reach_err_vec[:2], dtype=float)
         r_ee = float(np.linalg.norm(ee_xy))
         r_goal = float(np.linalg.norm(goal_xy))
-        if r_ee > 1e-6 and r_goal > 1e-6:
+        arc_radius_gate = max(0.05, float(reach_arc_min_radius))
+        if r_ee >= arc_radius_gate and r_goal >= arc_radius_gate:
             theta_ee = float(np.arctan2(ee_xy[1], ee_xy[0]))
             theta_goal = float(np.arctan2(goal_xy[1], goal_xy[0]))
             dtheta_short = _wrap_to_pi(theta_goal - theta_ee)
@@ -417,6 +726,8 @@ def infer_beliefs(observation, previous_belief=None, params=None):
                 reach_turn_sign = 1 if dtheta_short >= 0.0 else -1
             elif reach_turn_sign != 0 and abs(dtheta_short) <= release:
                 reach_turn_sign = 0
+        else:
+            reach_turn_sign = 0
 
         # Reach progress watchdog: if no improvement for long, trigger linear fallback.
         # While yaw-align is active, pause watchdog so intentional hold doesn't look like stall.
@@ -445,7 +756,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
 
         if (
             reach_cooldown == 0
-            and reach_error < approach_threshold
+            and reach_gate_counter >= reach_gate_stable_steps
             and reach_yaw_align_active == 0
             and phase_gate_ok
         ):
@@ -472,6 +783,14 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             reach_yaw_align_active = 0
             reach_yaw_align_timer = 0
             reach_yaw_align_done = 0
+            reach_gate_active = 0
+            reach_gate_counter = 0
+            align_gate_active = 0
+            align_gate_counter = 0
+            pregrasp_ready_counter = 0
+            descend_gate_active = 0
+            descend_gate_counter = 0
+            descend_yaw_enabled = 0
     elif phase == "Align":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -482,12 +801,24 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         reach_yaw_align_done = 0
         align_timer += 1
         align_error = np.linalg.norm(s_obj_mean - align_obj_rel)
-        align_ready = align_timer >= align_min_steps and gripper_open_ready
+        if align_gate_active == 1:
+            align_gate_active = int(align_error <= align_exit_threshold)
+        else:
+            align_gate_active = int(align_error <= align_enter_threshold)
+        align_gate_counter = (align_gate_counter + 1) if align_gate_active == 1 else 0
+
+        align_ready = (
+            align_timer >= align_min_steps
+            and gripper_open_ready
+            and align_gate_counter >= align_gate_stable_steps
+        )
         align_timeout = align_timer >= align_max_steps
-        align_timeout_near = align_error < (1.5 * align_threshold)
+        align_timeout_near = align_error <= align_exit_threshold
         if align_ready and align_error < align_threshold and phase_gate_ok:
             phase = "PreGraspHold"
+            last_retry_reason = ""
             pregrasp_hold_timer = 0
+            pregrasp_ready_counter = 0
             grasp_timer = 0
             stable_grasp_counter = 0
             descend_timer = 0
@@ -498,12 +829,16 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             lift_test_timer = 0
             release_contact_counter = 0
             release_warning = 0
+            align_gate_active = 0
+            align_gate_counter = 0
         elif align_timeout:
             # Timeout fallback: continue only when still near and gripper is open-ready.
             # Otherwise retry Reach to avoid entering a long hold stall.
             if align_timeout_near and gripper_open_ready and phase_gate_ok:
                 phase = "PreGraspHold"
+                last_retry_reason = ""
                 pregrasp_hold_timer = 0
+                pregrasp_ready_counter = 0
                 grasp_timer = 0
                 stable_grasp_counter = 0
                 descend_timer = 0
@@ -514,8 +849,11 @@ def infer_beliefs(observation, previous_belief=None, params=None):
                 lift_test_timer = 0
                 release_contact_counter = 0
                 release_warning = 0
+                align_gate_active = 0
+                align_gate_counter = 0
             else:
                 phase = "Reach"
+                last_retry_reason = "reach_stall"
                 reach_cooldown = reach_reentry_cooldown_steps
                 align_timer = 0
                 pregrasp_hold_timer = 0
@@ -525,6 +863,14 @@ def infer_beliefs(observation, previous_belief=None, params=None):
                 descend_timeout_extensions = 0
                 close_hold_timer = 0
                 lift_test_timer = 0
+                reach_gate_active = 0
+                reach_gate_counter = 0
+                align_gate_active = 0
+                align_gate_counter = 0
+                pregrasp_ready_counter = 0
+                descend_gate_active = 0
+                descend_gate_counter = 0
+                descend_yaw_enabled = 0
     elif phase == "PreGraspHold":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -534,17 +880,29 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         reach_yaw_align_timer = 0
         reach_yaw_align_done = 0
         pregrasp_hold_timer += 1
-        hold_ready = pregrasp_hold_timer >= pregrasp_hold_steps
+        align_error = np.linalg.norm(s_obj_mean - align_obj_rel)
+        if gripper_open_ready and align_error <= align_exit_threshold:
+            pregrasp_ready_counter += 1
+        else:
+            pregrasp_ready_counter = 0
+
+        hold_ready = pregrasp_ready_counter >= pregrasp_ready_steps
         hold_grace_elapsed = pregrasp_hold_timer >= (
             pregrasp_hold_steps + pregrasp_hold_ready_grace_steps
         )
-        if hold_ready and (gripper_open_ready or hold_grace_elapsed) and phase_gate_ok:
+        hold_timeout = pregrasp_hold_timer >= pregrasp_hold_steps
+        if (hold_ready or (hold_timeout and (gripper_open_ready or hold_grace_elapsed))) and phase_gate_ok:
             phase = "Descend"
+            last_retry_reason = ""
             descend_timer = 0
             descend_best_error = float("inf")
             descend_no_progress_steps = 0
             descend_timeout_extensions = 0
             stable_grasp_counter = 0
+            pregrasp_ready_counter = 0
+            descend_gate_active = 0
+            descend_gate_counter = 0
+            descend_yaw_enabled = 0
     elif phase == "Descend":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -560,9 +918,26 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         y_err = float(abs(descend_err_vec[1]))
         z_err = float(abs(descend_err_vec[2]))
 
-        xy_axis_ok = x_err <= descend_x_threshold and y_err <= descend_y_threshold
-        z_axis_ok = z_err <= descend_z_threshold
-        position_ok = (descend_error <= descend_threshold) or (xy_axis_ok and z_axis_ok)
+        xy_enter_ok = x_err <= descend_x_threshold and y_err <= descend_y_threshold
+        z_enter_ok = z_err <= descend_z_threshold
+        xy_exit_ok = x_err <= descend_exit_x_threshold and y_err <= descend_exit_y_threshold
+        z_exit_ok = z_err <= descend_exit_z_threshold
+
+        if descend_gate_active == 1:
+            descend_gate_active = int(xy_exit_ok and z_exit_ok)
+        else:
+            descend_gate_active = int(xy_enter_ok and z_enter_ok)
+        descend_gate_counter = (descend_gate_counter + 1) if descend_gate_active == 1 else 0
+
+        if descend_yaw_enabled == 1:
+            descend_yaw_enabled = int(xy_exit_ok)
+        else:
+            descend_yaw_enabled = int(xy_enter_ok)
+
+        position_ok = (
+            (descend_error <= descend_threshold and descend_gate_counter >= 2)
+            or (descend_gate_counter >= descend_gate_stable_steps)
+        )
 
         if not np.isfinite(descend_best_error):
             descend_best_error = descend_error
@@ -589,11 +964,15 @@ def infer_beliefs(observation, previous_belief=None, params=None):
 
         if (position_ok or (timeout_hit and timeout_near)) and phase_gate_ok:
             phase = "CloseHold"
+            last_retry_reason = ""
             close_hold_timer = 0
             stable_grasp_counter = 0
             descend_best_error = float("inf")
             descend_no_progress_steps = 0
             descend_timeout_extensions = 0
+            descend_gate_active = 0
+            descend_gate_counter = 0
+            descend_yaw_enabled = 0
         elif can_extend:
             descend_timeout_extensions += 1
             descend_timer = max(0, descend_timer - descend_timeout_extension_steps)
@@ -604,6 +983,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             if retry_count > max_retries:
                 retry_count = 0
             phase = "Reach"
+            last_retry_reason = "grasp_failed"
             align_timer = 0
             grasp_timer = 0
             lift_timer = 0
@@ -618,6 +998,14 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             lift_test_timer = 0
             release_contact_counter = 0
             release_warning = 0
+            reach_gate_active = 0
+            reach_gate_counter = 0
+            align_gate_active = 0
+            align_gate_counter = 0
+            pregrasp_ready_counter = 0
+            descend_gate_active = 0
+            descend_gate_counter = 0
+            descend_yaw_enabled = 0
     elif phase == "CloseHold":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -639,6 +1027,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             and phase_gate_ok
         ):
             phase = "LiftTest"
+            last_retry_reason = ""
             lift_test_timer = 0
             lift_test_ref_obj_rel = s_obj_mean.copy()
         elif close_hold_timer >= grasp_search_steps:
@@ -649,6 +1038,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
                 phase = "Reach"
             else:
                 phase = "Reach"
+            last_retry_reason = "grasp_failed"
             align_timer = 0
             grasp_timer = 0
             lift_timer = 0
@@ -663,6 +1053,14 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             lift_test_timer = 0
             release_contact_counter = 0
             release_warning = 0
+            reach_gate_active = 0
+            reach_gate_counter = 0
+            align_gate_active = 0
+            align_gate_counter = 0
+            pregrasp_ready_counter = 0
+            descend_gate_active = 0
+            descend_gate_counter = 0
+            descend_yaw_enabled = 0
     elif phase == "LiftTest":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -675,6 +1073,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         obj_rel_drift = np.linalg.norm(s_obj_mean - lift_test_ref_obj_rel)
         if s_grasp == 0:
             phase = "Reach"
+            last_retry_reason = "grasp_failed"
             align_timer = 0
             grasp_timer = 0
             lift_timer = 0
@@ -692,6 +1091,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             if retry_count > max_retries:
                 retry_count = 0
             phase = "Reach"
+            last_retry_reason = "grasp_failed"
             align_timer = 0
             grasp_timer = 0
             lift_timer = 0
@@ -710,6 +1110,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             if lift_test_timer >= lift_test_steps and phase_gate_ok:
                 retry_count = 0
                 phase = "Transit"
+                last_retry_reason = ""
                 transit_timer = 0
     elif phase == "Transit":
         reach_turn_sign = 0
@@ -723,8 +1124,10 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         ee_z = float(s_ee_mean[2])
         if ee_z >= (transit_height - transit_z_threshold):
             phase = "MoveToPlaceAbove"
+            last_retry_reason = ""
         elif s_grasp == 0:
             phase = "Reach"
+            last_retry_reason = "grasp_failed"
             reach_cooldown = reach_reentry_cooldown_steps
             align_timer = 0
             pregrasp_hold_timer = 0
@@ -750,12 +1153,17 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         err = s_target_mean - preplace_target_rel
         preplace_xy_ok = float(np.linalg.norm(err[:2])) <= preplace_xy_threshold
         preplace_z_ok = abs(float(err[2])) <= preplace_z_threshold
-        if (
-            float(np.linalg.norm(err)) <= preplace_threshold or (preplace_xy_ok and preplace_z_ok)
-        ) and phase_gate_ok:
+        if (preplace_xy_ok and preplace_z_ok) and phase_gate_ok:
             phase = "DescendToPlace"
+            last_retry_reason = ""
+            place_descend_timer = 0
+            place_descend_best_error = float("inf")
+            place_descend_no_progress_steps = 0
+            place_descend_timeout_extensions = 0
+            place_reapproach_count = 0
         elif s_grasp == 0:
             phase = "Reach"
+            last_retry_reason = "grasp_failed"
             reach_cooldown = reach_reentry_cooldown_steps
             align_timer = 0
             pregrasp_hold_timer = 0
@@ -778,16 +1186,87 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         reach_yaw_align_active = 0
         reach_yaw_align_timer = 0
         reach_yaw_align_done = 0
+        place_descend_timer += 1
         err = s_target_mean - place_target_rel
+        place_err = float(np.linalg.norm(err))
         place_xy_ok = float(np.linalg.norm(err[:2])) <= place_xy_threshold
         place_z_ok = abs(float(err[2])) <= place_z_threshold
-        if place_xy_ok and place_z_ok and phase_gate_ok:
+
+        if not np.isfinite(place_descend_best_error):
+            place_descend_best_error = place_err
+            place_descend_no_progress_steps = 0
+        elif place_err < (place_descend_best_error - place_descend_progress_eps):
+            place_descend_best_error = place_err
+            place_descend_no_progress_steps = 0
+        else:
+            place_descend_no_progress_steps += 1
+
+        timeout_hit = place_descend_timer >= place_descend_max_steps
+        timeout_near = (
+            float(np.linalg.norm(err[:2])) <= (1.5 * place_xy_threshold)
+            and abs(float(err[2])) <= (1.5 * place_z_threshold)
+        )
+        can_extend = (
+            timeout_hit
+            and not timeout_near
+            and place_descend_timeout_extensions < place_descend_max_timeout_extensions
+            and place_descend_no_progress_steps < place_descend_stall_steps
+        )
+
+        if place_xy_ok and place_z_ok and place_yaw_ok and phase_gate_ok:
             phase = "Open"
+            last_retry_reason = ""
             open_timer = 0
             release_contact_counter = 0
             release_warning = 0
+            release_detach_counter = 0
+            release_stable_counter = 0
+            place_descend_timer = 0
+            place_descend_best_error = float("inf")
+            place_descend_no_progress_steps = 0
+            place_descend_timeout_extensions = 0
+        elif can_extend:
+            place_descend_timeout_extensions += 1
+            place_descend_timer = max(0, place_descend_timer - place_descend_timeout_extension_steps)
+            place_descend_no_progress_steps = 0
+        elif timeout_hit:
+            if s_grasp == 1:
+                place_reapproach_count += 1
+                last_retry_reason = "place_alignment_failed"
+                place_descend_timer = 0
+                place_descend_best_error = float("inf")
+                place_descend_no_progress_steps = 0
+                place_descend_timeout_extensions = 0
+                if place_reapproach_count <= place_reapproach_max_retries:
+                    phase = "MoveToPlaceAbove"
+                else:
+                    phase = "Failure"
+                    failure_reason = "place_alignment_failed"
+            else:
+                phase = "Reach"
+                last_retry_reason = "grasp_failed"
+                reach_cooldown = reach_reentry_cooldown_steps
+                align_timer = 0
+                pregrasp_hold_timer = 0
+                descend_timer = 0
+                descend_best_error = float("inf")
+                descend_no_progress_steps = 0
+                descend_timeout_extensions = 0
+                close_hold_timer = 0
+                lift_test_timer = 0
+                transit_timer = 0
+                open_timer = 0
+                retreat_timer = 0
+                release_contact_counter = 0
+                release_warning = 0
+                place_descend_timer = 0
+                place_descend_best_error = float("inf")
+                place_descend_no_progress_steps = 0
+                place_descend_timeout_extensions = 0
+                place_reapproach_count = 0
         elif s_grasp == 0:
             phase = "Reach"
+            last_retry_reason = "grasp_failed"
             reach_cooldown = reach_reentry_cooldown_steps
             align_timer = 0
             pregrasp_hold_timer = 0
@@ -802,6 +1281,11 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             retreat_timer = 0
             release_contact_counter = 0
             release_warning = 0
+            place_descend_timer = 0
+            place_descend_best_error = float("inf")
+            place_descend_no_progress_steps = 0
+            place_descend_timeout_extensions = 0
+            place_reapproach_count = 0
     elif phase == "Open":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -816,10 +1300,63 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             release_contact_counter = 0
         if release_contact_counter >= release_contact_warn_steps:
             release_warning = 1
+
+        # Post-open release verification:
+        # 1) detached from gripper, 2) object stable near place target.
+        obj_to_target = np.asarray(s_target_mean - s_obj_mean, dtype=float)
+        obj_target_xy_err = float(np.linalg.norm(obj_to_target[:2]))
+        obj_target_z_err = float(abs(obj_to_target[2]))
+        # Release stability should use object world speed.
+        # o_obj is object relative to EE, so:
+        #   v_obj_world = v_obj_rel + v_ee_world
+        obj_world_vel = np.asarray(obj_vel, dtype=float).reshape(3) + np.asarray(ee_vel, dtype=float).reshape(3)
+        obj_speed = float(np.linalg.norm(obj_world_vel))
+        detached_now = int(observation["o_contact"] == 0 and gripper_open_ready)
+        if detached_now:
+            release_detach_counter += 1
+        else:
+            release_detach_counter = 0
+        stable_now = (
+            obj_target_xy_err <= release_obj_xy_threshold
+            and obj_target_z_err <= release_obj_z_threshold
+            and obj_speed <= release_obj_speed_threshold
+            and place_yaw_ok
+        )
+        if stable_now:
+            release_stable_counter += 1
+        else:
+            release_stable_counter = 0
+
+        release_ok = (
+            (not release_verify_enabled)
+            or (
+                release_detach_counter >= release_detach_hold_steps
+                and release_stable_counter >= release_stable_hold_steps
+            )
+        )
         open_timer += 1
-        if open_timer >= open_hold_steps:
+        if open_timer >= open_hold_steps and release_ok:
             phase = "Retreat"
+            last_retry_reason = ""
             retreat_timer = 0
+            release_reapproach_count = 0
+        elif open_timer >= open_max_steps and not release_ok:
+            last_retry_reason = "release_failed"
+            release_reapproach_count += 1
+            open_timer = 0
+            release_contact_counter = 0
+            release_detach_counter = 0
+            release_stable_counter = 0
+            release_warning = 0
+            place_descend_timer = 0
+            place_descend_best_error = float("inf")
+            place_descend_no_progress_steps = 0
+            place_descend_timeout_extensions = 0
+            if release_reapproach_count <= release_reapproach_max_retries:
+                phase = "MoveToPlaceAbove"
+            else:
+                phase = "Failure"
+                failure_reason = "release_failed"
     elif phase == "Retreat":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -851,6 +1388,35 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     if phase in ("Done",):
         s_grasp = 0
 
+    if phase != "Open":
+        release_detach_counter = 0
+        release_stable_counter = 0
+
+    if phase != "DescendToPlace":
+        place_descend_timer = 0
+        place_descend_best_error = float("inf")
+        place_descend_no_progress_steps = 0
+        place_descend_timeout_extensions = 0
+
+    if phase in ("Reach", "Align", "PreGraspHold", "Descend", "CloseHold", "LiftTest", "Failure", "Done"):
+        place_reapproach_count = 0
+
+    if phase in ("Reach", "Align", "PreGraspHold", "Descend", "CloseHold", "LiftTest", "Retreat", "Done", "Failure"):
+        release_reapproach_count = 0
+
+    if phase != "Reach":
+        reach_gate_active = 0
+        reach_gate_counter = 0
+    if phase != "Align":
+        align_gate_active = 0
+        align_gate_counter = 0
+    if phase != "PreGraspHold":
+        pregrasp_ready_counter = 0
+    if phase != "Descend":
+        descend_gate_active = 0
+        descend_gate_counter = 0
+        descend_yaw_enabled = 0
+
     if phase in ("Reach", "Align", "PreGraspHold", "Descend", "CloseHold", "LiftTest", "Transit", "MoveToPlaceAbove", "DescendToPlace"):
         # Ensure lift-test reference remains defined across non-done phases.
         if lift_test_ref_obj_rel is None:
@@ -861,11 +1427,27 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "s_obj_mean": s_obj_mean,
         "s_target_mean": s_target_mean,
         "s_obj_yaw": float(obj_yaw_obs),
+        "reach_obj_rel_local": reach_obj_rel_local.copy(),
+        "align_obj_rel_local": align_obj_rel_local.copy(),
+        "descend_obj_rel_local": descend_obj_rel_local.copy(),
+        "approach_side_sign": float(approach_side_sign),
         "reach_obj_rel": reach_obj_rel.copy(),
         "align_obj_rel": align_obj_rel.copy(),
         "descend_obj_rel": descend_obj_rel.copy(),
         "preplace_target_rel": preplace_target_rel.copy(),
         "place_target_rel": place_target_rel.copy(),
+        "use_world_place_goal_pose": int(use_world_place_goal_pose),
+        "place_goal_world_xyz": np.asarray(place_goal_world_xyz, dtype=float).copy(),
+        "place_goal_world_pose6d_deg": (
+            None
+            if place_goal_world_pose6d_deg is None
+            else np.asarray(place_goal_world_pose6d_deg, dtype=float).copy()
+        ),
+        "place_goal_yaw": float(place_goal_world_yaw),
+        "place_goal_yaw_enabled": int(place_goal_yaw_enabled),
+        "place_goal_yaw_threshold": float(place_goal_yaw_threshold),
+        "place_goal_yaw_pi_symmetric": int(place_goal_yaw_pi_symmetric),
+        "place_goal_yaw_error": float(place_yaw_error),
         "retreat_move": retreat_move.copy(),
         "s_ee_cov": previous_belief["s_ee_cov"],
         "s_obj_cov": s_obj_cov,
@@ -886,10 +1468,18 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "reach_yaw_align_active": int(reach_yaw_align_active),
         "reach_yaw_align_timer": int(reach_yaw_align_timer),
         "reach_yaw_align_done": int(reach_yaw_align_done),
+        "reach_gate_active": int(reach_gate_active),
+        "reach_gate_counter": int(reach_gate_counter),
+        "align_gate_active": int(align_gate_active),
+        "align_gate_counter": int(align_gate_counter),
+        "pregrasp_ready_counter": int(pregrasp_ready_counter),
+        "descend_gate_active": int(descend_gate_active),
+        "descend_gate_counter": int(descend_gate_counter),
+        "descend_yaw_enabled": int(descend_yaw_enabled),
         "prev_o_grip": grip_obs,
-        "prev_o_contact": int(observation["o_contact"]),
+        "prev_o_contact": int(contact_obs),
         "prev_o_obj": np.asarray(obj_obs, dtype=float).copy(),
-        "prev_o_target": np.asarray(observation["o_target"], dtype=float).copy(),
+        "prev_o_target": np.asarray(target_obs, dtype=float).copy(),
         "obs_confidence": float(obs_confidence),
         "phase_conf_ok": int(phase_conf_ok),
         "phase_vfe_ok": int(phase_vfe_ok),
@@ -913,5 +1503,24 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "retreat_timer": retreat_timer,
         "release_contact_counter": int(release_contact_counter),
         "release_warning": int(release_warning),
+        "release_detach_counter": int(release_detach_counter),
+        "release_stable_counter": int(release_stable_counter),
+        "release_reapproach_count": int(release_reapproach_count),
+        "place_descend_timer": int(place_descend_timer),
+        "place_descend_best_error": float(place_descend_best_error),
+        "place_descend_no_progress_steps": int(place_descend_no_progress_steps),
+        "place_descend_timeout_extensions": int(place_descend_timeout_extensions),
+        "place_reapproach_count": int(place_reapproach_count),
+        "recovery_branch": str(recovery_branch),
+        "recovery_branch_retry": int(recovery_branch_retry),
+        "recovery_global_count": int(recovery_global_count),
+        "bt_branch_retry_cap": int(bt_branch_retry_cap),
+        "bt_global_recovery_cap": int(bt_global_recovery_cap),
+        "bt_rescan_hold_steps": int(bt_rescan_hold_steps),
+        "bt_reapproach_offset_xy": float(bt_reapproach_offset_xy),
+        "bt_safe_backoff_hold_steps": int(bt_safe_backoff_hold_steps),
+        "bt_safe_backoff_z_boost": float(bt_safe_backoff_z_boost),
         "retry_count": retry_count,
+        "last_retry_reason": str(last_retry_reason),
+        "failure_reason": str(failure_reason),
     }

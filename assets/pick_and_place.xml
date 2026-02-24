@@ -28,7 +28,7 @@
       <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
   
       <body name="floor" pos="0. 0. 0.">
-        <site name="target" pos="0.4 0.0 0.2" size=".02 .02 .02" rgba="1 0.0 0.0 1" type="sphere"/>
+        <site name="target" pos="0.6 0.2 0.0" size=".02 .02 .02" rgba="1 0.0 0.0 1" type="sphere"/>
       </body>
   
       <body name="obj" pos="0.4 0 0.2" quat="1 0 0 0">  # 0.9239 0 0 0.3827

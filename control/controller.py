@@ -182,6 +182,10 @@ class EEController:
             optional: "yaw_target": float (radians) or cardinal int {0,1,2,3},
             optional: "yaw_pi_symmetric": bool (treat yaw and yaw+pi as equivalent; pick shorter turn),
             optional: "enable_topdown_objective": bool,
+            optional: "position_gain_scale": float (>0),
+            optional: "yaw_weight_scale": float (>0),
+            optional: "topdown_weight_scale": float (>0),
+            optional: "nullspace_gain_scale": float (>0),
         }
         If ee_target_pos is given, move is computed as (ee_target_pos - current_ee), clamped by max_step * max_step_scale.
         """
@@ -196,6 +200,11 @@ class EEController:
         self._step_yaw_target = self._interpret_yaw_target(action.get("yaw_target", self.yaw_target))
         self._step_yaw_pi_symmetric = bool(action.get("yaw_pi_symmetric", False))
         self._step_enable_topdown = action.get("enable_topdown_objective", self.enable_topdown_objective)
+        # Optional per-step gain scheduling (useful for softer grasp/place phases).
+        self._step_position_gain_scale = float(np.clip(action.get("position_gain_scale", 1.0), 0.05, 2.0))
+        self._step_yaw_weight_scale = float(np.clip(action.get("yaw_weight_scale", 1.0), 0.05, 2.0))
+        self._step_topdown_weight_scale = float(np.clip(action.get("topdown_weight_scale", 1.0), 0.05, 2.0))
+        self._step_nullspace_gain_scale = float(np.clip(action.get("nullspace_gain_scale", 1.0), 0.05, 2.0))
 
         if "ee_target_pos" in action:
             ee = self.simulator.get_ee_position()
@@ -225,6 +234,8 @@ class EEController:
                 f"applied_move={self.last_applied_move_norm:.4f} max_step={self.max_step:.4f} "
                 f"dq_raw={self.last_dq_norm_raw:.4f} dq_applied={self.last_dq_norm_applied:.4f} "
                 f"max_joint_step={self.max_joint_step:.4f} "
+                f"scales=pos:{self._step_position_gain_scale:.2f},yaw:{self._step_yaw_weight_scale:.2f},"
+                f"top:{self._step_topdown_weight_scale:.2f},null:{self._step_nullspace_gain_scale:.2f} "
                 f"gripper={self.gripper_state}/{self.gripper_mode}"
             )
 
@@ -232,9 +243,22 @@ class EEController:
         delta = np.array(delta, dtype=float).reshape(3,)
         if not np.all(np.isfinite(delta)):
             return
+        gain = float(getattr(self, "_step_position_gain_scale", 1.0))
+        delta = gain * delta
         # Real robots use velocity smoothing/limits to avoid jerky path changes.
         alpha = float(np.clip(self.move_smoothing, 0.0, 0.95))
-        delta = alpha * self.prev_move_delta + (1.0 - alpha) * delta
+        prev = self.prev_move_delta.copy()
+        # If an axis command goes to zero or flips sign, clear smoothing memory
+        # on that axis so stale momentum does not push the wrong way.
+        axis_eps = 1e-6
+        for i in range(3):
+            cmd_i = float(delta[i])
+            prev_i = float(prev[i])
+            if abs(cmd_i) <= axis_eps:
+                prev[i] = 0.0
+            elif abs(prev_i) > axis_eps and np.sign(cmd_i) != np.sign(prev_i):
+                prev[i] = 0.0
+        delta = alpha * prev + (1.0 - alpha) * delta
         self.prev_move_delta = delta.copy()
         self.last_requested_move_norm = float(np.linalg.norm(delta))
         n = np.linalg.norm(delta)
@@ -276,6 +300,7 @@ class EEController:
         # Prefer approaching from above: align tool axis with world down.
         if getattr(self, "_step_enable_topdown", self.enable_topdown_objective):
             top_w = self.topdown_weight_grasp if grip_cmd == 1 else self.topdown_weight
+            top_w = float(top_w) * float(getattr(self, "_step_topdown_weight_scale", 1.0))
             if top_w > 0.0:
                 ee_xmat = self._get_ee_xmat()
                 axis_idx = int(np.clip(self.tool_axis, 0, 2))
@@ -295,6 +320,7 @@ class EEController:
                 pi_symmetric=bool(getattr(self, "_step_yaw_pi_symmetric", False)),
             )
             yaw_w = self.yaw_weight_grasp if grip_cmd == 1 else self.yaw_weight
+            yaw_w = float(yaw_w) * float(getattr(self, "_step_yaw_weight_scale", 1.0))
             if yaw_w > 0.0:
                 J_yaw = jacr[2, self.arm_dof_addr].reshape(1, -1)
                 J = np.vstack([J, yaw_w * J_yaw])
@@ -318,6 +344,7 @@ class EEController:
 
         q = data.qpos[self.arm_qpos_addr].copy()
         null_gain = self.nullspace_gain_grasp if grip_cmd == 1 else self.nullspace_gain
+        null_gain = float(null_gain) * float(getattr(self, "_step_nullspace_gain_scale", 1.0))
         dq_null = null_gain * (self.q_pref - q)
         N = np.eye(len(q)) - (J_pinv @ J)
         dq = dq_task + N @ dq_null

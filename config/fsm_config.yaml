@@ -67,7 +67,7 @@ policy:
   dynamic_grip_contact_margin: 0.004
   dynamic_grip_min_close_width: 0.0
   dynamic_open_enabled: true
-  dynamic_open_object_width: 0.04
+  dynamic_open_object_width: 0.01 
   dynamic_open_margin: 0.01
   dynamic_open_contact_boost: 0.003
 

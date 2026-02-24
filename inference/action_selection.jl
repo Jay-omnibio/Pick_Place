@@ -38,6 +38,47 @@ function _object_yaw_target(current_belief)
     return _wrap_to_pi(obj_yaw + 0.5 * pi)
 end
 
+function _place_yaw_target(
+    current_belief,
+    place_goal_world_yaw::Float64,
+    place_goal_gripper_yaw_offset::Float64,
+)
+    obj_goal_yaw = Float64(get(current_belief, :place_goal_yaw, place_goal_world_yaw))
+    if !isfinite(obj_goal_yaw)
+        obj_goal_yaw = place_goal_world_yaw
+    end
+    # Keep same jaw/object relation at placement as during grasp.
+    return _wrap_to_pi(obj_goal_yaw + place_goal_gripper_yaw_offset)
+end
+
+function _phase_gain_scales(phase)
+    table = Dict(
+        :Reach => (1.00, 1.00, 1.00, 1.00),
+        :Align => (0.85, 1.00, 1.00, 0.95),
+        :PreGraspHold => (0.70, 1.10, 1.10, 0.85),
+        :Descend => (0.58, 1.15, 1.15, 0.80),
+        :CloseHold => (0.40, 1.15, 1.10, 0.75),
+        :Grasp => (0.40, 1.15, 1.10, 0.75),
+        :LiftTest => (0.75, 1.00, 1.00, 0.90),
+        :Transit => (0.90, 1.00, 1.00, 0.95),
+        :MoveToPlaceAbove => (0.88, 1.00, 1.00, 0.95),
+        :DescendToPlace => (0.60, 1.15, 1.15, 0.80),
+        :Open => (0.45, 1.10, 1.10, 0.80),
+        :Retreat => (0.80, 1.00, 1.00, 0.90),
+        :Done => (0.50, 1.00, 1.00, 0.90),
+        :Lift => (0.80, 1.00, 1.00, 0.90),
+    )
+    pos, yaw, top, null = get(table, phase, (1.0, 1.0, 1.0, 1.0))
+    return (
+        position_gain_scale = Float64(pos),
+        yaw_weight_scale = Float64(yaw),
+        topdown_weight_scale = Float64(top),
+        nullspace_gain_scale = Float64(null),
+    )
+end
+
+_attach_phase_gains(action, phase) = merge(action, _phase_gain_scales(phase))
+
 function generate_candidate_actions(delta::Float64)
     moves = [
         [ delta, 0.0, 0.0],
@@ -126,6 +167,25 @@ function select_action(current_belief, params)
     confidence_speed_min_scale = Float64(_require(params, :confidence_speed_min_scale))
     reach_confidence_speed_power = Float64(_require(params, :reach_confidence_speed_power))
     descend_confidence_speed_power = Float64(_require(params, :descend_confidence_speed_power))
+    place_goal_yaw_enabled = Bool(_require(params, :place_goal_yaw_enabled))
+    place_goal_yaw_pi_symmetric = Bool(_require(params, :place_goal_yaw_pi_symmetric))
+    place_goal_world_yaw = deg2rad(Float64(_require(params, :place_goal_world_yaw_deg)))
+    if haskey(params, :place_goal_world_pose6d_deg)
+        pose6 = Float64.(params[:place_goal_world_pose6d_deg])
+        if length(pose6) != 6
+            error(
+                "Active-inference config key 'place_goal_world_pose6d_deg' must be length-6 " *
+                "[x,y,z,roll_deg,pitch_deg,yaw_deg]."
+            )
+        end
+        if any(!isfinite, pose6)
+            error("Active-inference config key 'place_goal_world_pose6d_deg' must contain finite values.")
+        end
+        place_goal_world_yaw = deg2rad(Float64(pose6[6]))
+    end
+    place_goal_gripper_yaw_offset = deg2rad(
+        Float64(_require(params, :place_goal_gripper_yaw_offset_deg))
+    )
 
     phase = current_belief[:phase]
     obs_conf = Float64(get(current_belief, :obs_confidence, 1.0))
@@ -149,14 +209,14 @@ function select_action(current_belief, params)
         reach_yaw_align_active = Int(get(current_belief, :reach_yaw_align_active, 0)) != 0
 
         if reach_yaw_align_active
-            return (
+            return _attach_phase_gains((
                 move = [0.0, 0.0, 0.0],
                 grip = -1,
                 enable_yaw_objective = true,
                 yaw_target = _object_yaw_target(current_belief),
                 yaw_pi_symmetric = true,
                 enable_topdown_objective = true,
-            )
+            ), phase)
         end
 
         err = s_obj - reach_obj_rel
@@ -181,6 +241,12 @@ function select_action(current_belief, params)
         else
             z_weight = (reach_z_blend_start - xy_max) / max(1e-6, (reach_z_blend_start - reach_z_blend_full))
         end
+        # Strict XY-first reach:
+        # keep Z correction off until both XY axes are within thresholds.
+        xy_out = (abs_x > reach_axis_threshold_x) || (abs_y > reach_axis_threshold_y)
+        if xy_out
+            z_weight = 0.0
+        end
 
         desired_xy = [w_x * err[1], w_y * err[2]]
 
@@ -189,7 +255,8 @@ function select_action(current_belief, params)
             goal_xy = [s_ee[1] + err[1], s_ee[2] + err[2]]
             r_ee = norm(ee_xy)
             r_goal = norm(goal_xy)
-            if r_ee > 1e-6 && r_goal > 1e-6
+            arc_radius_gate = max(0.05, reach_arc_min_radius)
+            if r_ee >= arc_radius_gate && r_goal >= arc_radius_gate
                 theta_ee = atan(ee_xy[2], ee_xy[1])
                 theta_goal = atan(goal_xy[2], goal_xy[1])
                 dtheta_signed = _signed_angle_to_goal(theta_ee, theta_goal, reach_turn_sign)
@@ -220,12 +287,12 @@ function select_action(current_belief, params)
                 desired_move = (desired_move / desired_norm) * step_limit
             end
         end
-        return (
+        return _attach_phase_gains((
             move = desired_move,
             grip = -1,
             enable_yaw_objective = false,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :Align
         s_obj = Float64.(current_belief[:s_obj_mean])
         err = s_obj - align_obj_rel
@@ -234,14 +301,14 @@ function select_action(current_belief, params)
         if n > align_step && n > 0.0
             desired = (desired / n) * align_step
         end
-        return (
+        return _attach_phase_gains((
             move = desired,
             grip = -1,
             enable_yaw_objective = true,
             yaw_target = _object_yaw_target(current_belief),
             yaw_pi_symmetric = true,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :PreGraspHold
         s_obj = Float64.(current_belief[:s_obj_mean])
         err = s_obj - align_obj_rel
@@ -250,14 +317,14 @@ function select_action(current_belief, params)
         if n > pregrasp_hold_step && n > 0.0
             desired = (desired / n) * pregrasp_hold_step
         end
-        return (
+        return _attach_phase_gains((
             move = desired,
             grip = -1,
             enable_yaw_objective = true,
             yaw_target = _object_yaw_target(current_belief),
             yaw_pi_symmetric = true,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :Descend
         s_obj = Float64.(current_belief[:s_obj_mean])
         err = s_obj - descend_obj_rel
@@ -312,8 +379,20 @@ function select_action(current_belief, params)
         if n > descend_step_cap && n > 0.0
             desired = (desired / n) * descend_step_cap
         end
-        yaw_enable = !(x_out || y_out)
-        return (
+        descend_yaw_enabled = Int(get(current_belief, :descend_yaw_enabled, 0)) != 0
+        yaw_enable = descend_yaw_enabled
+        phase_scales = _phase_gain_scales(:Descend)
+        if !descend_yaw_enabled
+            # Keep top-down objective enabled, but reduce orientation/nullspace
+            # influence until XY is stably within descend gate.
+            phase_scales = (
+                position_gain_scale = max(Float64(phase_scales.position_gain_scale), 0.90),
+                yaw_weight_scale = Float64(phase_scales.yaw_weight_scale),
+                topdown_weight_scale = min(Float64(phase_scales.topdown_weight_scale), 0.35),
+                nullspace_gain_scale = min(Float64(phase_scales.nullspace_gain_scale), 0.70),
+            )
+        end
+        return merge((
             move = desired,
             grip = -1,
             # Yaw alignment can perturb XY while descending near the object.
@@ -322,34 +401,38 @@ function select_action(current_belief, params)
             yaw_target = _object_yaw_target(current_belief),
             yaw_pi_symmetric = true,
             enable_topdown_objective = true,
-        )
+        ), phase_scales)
     elseif phase == :CloseHold || phase == :Grasp
-        return (
+        return _attach_phase_gains((
             move = [0.0, 0.0, 0.0],
             grip = 1,
             enable_yaw_objective = true,
             yaw_target = _object_yaw_target(current_belief),
             yaw_pi_symmetric = true,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :LiftTest
-        return (
+        return _attach_phase_gains((
             move = [0.0, 0.0, delta],
             grip = 1,
             enable_yaw_objective = true,
             yaw_target = _object_yaw_target(current_belief),
             yaw_pi_symmetric = true,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :Transit
-        return (
+        yaw_target = place_goal_yaw_enabled ?
+            _place_yaw_target(current_belief, place_goal_world_yaw, place_goal_gripper_yaw_offset) :
+            _object_yaw_target(current_belief)
+        yaw_pi = place_goal_yaw_enabled ? place_goal_yaw_pi_symmetric : true
+        return _attach_phase_gains((
             move = [0.0, 0.0, delta],
             grip = 1,
             enable_yaw_objective = true,
-            yaw_target = _object_yaw_target(current_belief),
-            yaw_pi_symmetric = true,
+            yaw_target = yaw_target,
+            yaw_pi_symmetric = yaw_pi,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :MoveToPlaceAbove
         s_target = Float64.(current_belief[:s_target_mean])
         err = s_target - preplace_target_rel
@@ -358,14 +441,18 @@ function select_action(current_belief, params)
         if n > reach_delta && n > 0.0
             desired = (desired / n) * reach_delta
         end
-        return (
+        yaw_target = place_goal_yaw_enabled ?
+            _place_yaw_target(current_belief, place_goal_world_yaw, place_goal_gripper_yaw_offset) :
+            _object_yaw_target(current_belief)
+        yaw_pi = place_goal_yaw_enabled ? place_goal_yaw_pi_symmetric : true
+        return _attach_phase_gains((
             move = desired,
             grip = 1,
             enable_yaw_objective = true,
-            yaw_target = _object_yaw_target(current_belief),
-            yaw_pi_symmetric = true,
+            yaw_target = yaw_target,
+            yaw_pi_symmetric = yaw_pi,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :DescendToPlace
         s_target = Float64.(current_belief[:s_target_mean])
         err = s_target - place_target_rel
@@ -377,43 +464,55 @@ function select_action(current_belief, params)
         if n > grasp_step && n > 0.0
             desired = (desired / n) * grasp_step
         end
-        return (
+        yaw_target = place_goal_yaw_enabled ?
+            _place_yaw_target(current_belief, place_goal_world_yaw, place_goal_gripper_yaw_offset) :
+            _object_yaw_target(current_belief)
+        yaw_pi = place_goal_yaw_enabled ? place_goal_yaw_pi_symmetric : true
+        return _attach_phase_gains((
             move = desired,
             grip = 1,
             enable_yaw_objective = true,
-            yaw_target = _object_yaw_target(current_belief),
-            yaw_pi_symmetric = true,
+            yaw_target = yaw_target,
+            yaw_pi_symmetric = yaw_pi,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :Open
-        return (
+        yaw_target = place_goal_yaw_enabled ?
+            _place_yaw_target(current_belief, place_goal_world_yaw, place_goal_gripper_yaw_offset) :
+            _object_yaw_target(current_belief)
+        yaw_pi = place_goal_yaw_enabled ? place_goal_yaw_pi_symmetric : true
+        return _attach_phase_gains((
             move = [0.0, 0.0, 0.0],
             grip = -1,
             enable_yaw_objective = true,
-            yaw_target = _object_yaw_target(current_belief),
-            yaw_pi_symmetric = true,
+            yaw_target = yaw_target,
+            yaw_pi_symmetric = yaw_pi,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :Retreat
         rv_norm = norm(retreat_move)
         desired = rv_norm > 1e-9 ? (retreat_move / rv_norm) * delta : [0.0, 0.0, delta]
-        return (
+        yaw_target = place_goal_yaw_enabled ?
+            _place_yaw_target(current_belief, place_goal_world_yaw, place_goal_gripper_yaw_offset) :
+            _object_yaw_target(current_belief)
+        yaw_pi = place_goal_yaw_enabled ? place_goal_yaw_pi_symmetric : true
+        return _attach_phase_gains((
             move = desired,
             grip = -1,
             enable_yaw_objective = true,
-            yaw_target = _object_yaw_target(current_belief),
-            yaw_pi_symmetric = true,
+            yaw_target = yaw_target,
+            yaw_pi_symmetric = yaw_pi,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :Done
-        return (
+        return _attach_phase_gains((
             move = [0.0, 0.0, 0.0],
             grip = -1,
             enable_yaw_objective = false,
             enable_topdown_objective = true,
-        )
+        ), phase)
     elseif phase == :Lift
-        return (move = [0.0, 0.0, delta], grip = 1)
+        return _attach_phase_gains((move = [0.0, 0.0, delta], grip = 1), phase)
     end
 
     candidate_actions = generate_candidate_actions(delta)
@@ -429,5 +528,5 @@ function select_action(current_belief, params)
         end
     end
 
-    return best_action
+    return _attach_phase_gains(best_action, phase)
 end

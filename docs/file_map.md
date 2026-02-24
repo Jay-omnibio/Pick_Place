@@ -61,6 +61,7 @@ This is a quick reference for what each important file is used for.
 | File | Use |
 |---|---|
 | `tools/plot_run_metrics.py` | Converts run CSV logs into plots for analysis. |
+| `tools/analyze_run_diagnostics.py` | Produces a concise diagnostics summary (phase transitions, retry/failure reasons, descend drift patterns) and optional debug plot from one run CSV. |
 | `tools/extract_mermaid_from_md.py` | Extracts Mermaid code blocks from Markdown into standalone `.mmd` files. |
 | `logs/run_*.csv` | Runtime outputs (phase, errors, action, true states). |
 | `logs/plots/run_*/` | Generated figures from log plotting tool. |
@@ -83,6 +84,7 @@ This is a quick reference for what each important file is used for.
 | `docs/real_world_grasp_transition_plan.md` | Transition plan from sim behavior to real-world grasping constraints. |
 | `docs/robot_mind_spec.md` | Higher-level design/spec notes. |
 | `docs/plots_guide.md` | Plot interpretation and usage guide. |
+| `docs/motion_wave_isolation_checklist.md` | Step-by-step A/B/C test plan to isolate wave-like EE path causes (yaw/smoothing/arc/frame effects). |
 
 ## Quick "Where To Edit" Guide
 
