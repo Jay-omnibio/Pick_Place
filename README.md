@@ -1,23 +1,25 @@
 # Active Inference Pick-and-Place (MuJoCo)
 
-This repo runs a pick → lift → place baseline in MuJoCo using a clean separation of:
+This repo runs a pick -> lift -> place pipeline in MuJoCo with an active-inference + behavior-tree runtime.
+
+Core modules:
 
 - **Simulation**: `env/`
 - **Sensors**: `env/sensors.py` (noisy observations)
 - **Perception**: `perception/` (Kalman filter, outlier rejection, latency handling)
 - **Backends**: `backends/` (SensorBackend, ActuatorBackend for sim/real swap)
 - **Safety**: `safety/` (workspace bounds, velocity limits)
-- **Task FSM**: `tasks/pick_place_fsm.py`
-- **Policy**: `policies/scripted_pick_place.py`
 - **Controller**: `control/controller.py`
 - **Agent**: `agent/agent_loop.py`
+- **Inference**: `inference_interface.py`, `inference/action_selection.py`, `agent/ai_behavior_tree.py`
 
-The **active inference / RxInfer** pieces are kept in `inference/` for later integration.
+The runtime is **active-inference only** (FSM mode removed).
 
 ## Assets and simulation setup
 
-- **panda_mocap.xml**: Put your Panda robot MuJoCo model in `assets/` (same dir as `pick_and_place.xml`). The scene expects `assets/panda_mocap.xml`. If it lives elsewhere, create a symlink: `ln -s /path/to/panda_mocap.xml assets/panda_mocap.xml`
-- **Scene**: Object at (0.6, 0, 0.2), place target at (0.4, 0, 0.2), 50 Hz control loop.
+- **panda_mocap.xml**: Put your Panda robot MuJoCo model in `assets/` as `assets/panda_mocap.xml`.
+- **Place target**: configured in `config/common_robot.yaml` under `task_shared`.
+- **Loop rate**: default control loop is ~50 Hz in `run_pick_place.py`.
 
 ## Run the simulation
 
@@ -56,7 +58,7 @@ Notes:
 
 ## Config
 
-- `config/sensor_config.yaml`: sensor noise, observation filter (Kalman, outlier rejection, latency).
-- `config/safety_config.yaml`: workspace bounds, max velocity.
-- Set `observation_filter.enabled: false` in sensor config to disable the filter.
-
+- `config/common_robot.yaml`: shared runtime config (`run`, `controller`, `task_shared`).
+- `config/active_inference_config.yaml`: active inference + BT + phase/action tuning.
+- `config/sensor_config.yaml`: sensor noise and observation filtering.
+- `config/safety_config.yaml`: workspace bounds and velocity limits.

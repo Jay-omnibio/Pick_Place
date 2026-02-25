@@ -1,27 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import fields
 from pathlib import Path
-from typing import Any, Dict, Type, TypeVar
+from typing import Any, Dict
 
 import numpy as np
 import yaml
 
-from policies.scripted_pick_place import PolicyConfig
-from tasks.pick_place_fsm import TaskConfig
-
-T = TypeVar("T")
-
 DEFAULT_COMMON_CONFIG_PATH = "config/common_robot.yaml"
-DEFAULT_FSM_CONFIG_PATH = "config/fsm_config.yaml"
 DEFAULT_ACTIVE_INFERENCE_CONFIG_PATH = "config/active_inference_config.yaml"
 
 COMMON_REQUIRED_TOP_LEVEL_KEYS = {"run", "controller"}
 COMMON_ALLOWED_TOP_LEVEL_KEYS = COMMON_REQUIRED_TOP_LEVEL_KEYS | {"task_shared"}
-FSM_TOP_LEVEL_KEYS = {"task", "policy"}
 ACTIVE_TOP_LEVEL_KEYS = {"inference", "action_selection"}
 
-REQUIRED_RUN_KEYS = {"control_mode", "log_every_steps"}
+REQUIRED_RUN_KEYS = {"log_every_steps"}
 REQUIRED_CONTROLLER_KEYS = {
     "max_step",
     "min_height",
@@ -285,31 +277,6 @@ def _check_missing_keys(section_name: str, data: Dict[str, Any], required_keys: 
         raise ValueError(f"Missing required keys in section '{section_name}': {missing}")
 
 
-def _coerce_from_type(value: Any, field_type: Any) -> Any:
-    field_type_name = str(field_type)
-    if field_type is np.ndarray or field_type_name in {"np.ndarray", "numpy.ndarray"}:
-        return np.asarray(value, dtype=float)
-    if field_type is bool or field_type_name == "bool":
-        return bool(value)
-    if field_type is int or field_type_name == "int":
-        return int(value)
-    if field_type is float or field_type_name == "float":
-        return float(value)
-    return value
-
-
-def _build_dataclass_from_section(cls: Type[T], section_name: str, data: Dict[str, Any]) -> T:
-    field_defs = {f.name: f for f in fields(cls)}
-    allowed = set(field_defs.keys())
-    _check_unknown_keys(section_name, data, allowed)
-    _check_missing_keys(section_name, data, allowed)
-
-    kwargs: Dict[str, Any] = {}
-    for name, f in field_defs.items():
-        kwargs[name] = _coerce_from_type(data[name], f.type)
-    return cls(**kwargs)  # type: ignore[arg-type]
-
-
 def _coerce_active_section(
     section_name: str,
     data: Dict[str, Any],
@@ -364,11 +331,9 @@ def _coerce_active_section(
 
 def load_runtime_sections(
     common_path: str = DEFAULT_COMMON_CONFIG_PATH,
-    fsm_path: str = DEFAULT_FSM_CONFIG_PATH,
     active_inference_path: str = DEFAULT_ACTIVE_INFERENCE_CONFIG_PATH,
 ) -> Dict[str, Any]:
     common_cfg_path = Path(common_path)
-    fsm_cfg_path = Path(fsm_path)
     ai_cfg_path = Path(active_inference_path)
 
     common_raw = _load_yaml_dict(common_cfg_path, "common")
@@ -379,7 +344,6 @@ def load_runtime_sections(
     _check_unknown_keys("run", run_cfg, REQUIRED_RUN_KEYS)
     _check_missing_keys("run", run_cfg, REQUIRED_RUN_KEYS)
     run_cfg_out = {
-        "control_mode": str(run_cfg["control_mode"]),
         "log_every_steps": int(run_cfg["log_every_steps"]),
     }
 
@@ -443,14 +407,6 @@ def load_runtime_sections(
             shared_task_cfg["target_world_xyz"] = pose6[:3].copy()
             shared_task_cfg["target_world_yaw_deg"] = float(pose6[5])
 
-    fsm_raw = _load_yaml_dict(fsm_cfg_path, "fsm")
-    _check_unknown_keys("fsm_root", fsm_raw, FSM_TOP_LEVEL_KEYS)
-    _check_missing_keys("fsm_root", fsm_raw, FSM_TOP_LEVEL_KEYS)
-    task_cfg = _build_dataclass_from_section(TaskConfig, "task", _ensure_dict("task", fsm_raw["task"]))
-    policy_cfg = _build_dataclass_from_section(
-        PolicyConfig, "policy", _ensure_dict("policy", fsm_raw["policy"])
-    )
-
     ai_raw = _load_yaml_dict(ai_cfg_path, "active_inference")
     _check_unknown_keys("active_inference_root", ai_raw, ACTIVE_TOP_LEVEL_KEYS)
     _check_missing_keys("active_inference_root", ai_raw, ACTIVE_TOP_LEVEL_KEYS)
@@ -477,14 +433,11 @@ def load_runtime_sections(
 
     return {
         "common_path": str(common_cfg_path),
-        "fsm_path": str(fsm_cfg_path),
         "active_inference_path": str(ai_cfg_path),
         "found": True,
         "strict": True,
         "run_cfg": run_cfg_out,
         "controller_cfg": controller_cfg_out,
         "shared_task_cfg": shared_task_cfg,
-        "task_cfg": task_cfg,
-        "policy_cfg": policy_cfg,
         "active_inference_cfg": active_inference_cfg,
     }

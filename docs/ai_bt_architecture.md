@@ -6,8 +6,7 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
 ## Current Design (Implemented)
 
 ### BT Scope
-- BT is enabled only in `active_inference` mode.
-- FSM path is unchanged.
+- Runtime is active-inference only.
 
 ### BT Structure
 - Root: `Selector`
@@ -42,7 +41,8 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
 
 ### Recovery Behavior
 - On BT recovery request:
-  - phase is reset to `Reach`
+  - phase is reset to `Reach` for pick-side failures
+  - place-side alignment failures can re-enter `MoveToPlaceAbove` when grasp is still retained
   - key timers/counters are reset
   - cooldown is applied
   - retry count increments
@@ -57,6 +57,66 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
    - keep running, recover, or terminal.
 4. `select_action(...)` outputs control command for current phase.
 5. Controller + safety checker execute command.
+
+## Failure Detection Flow (Current)
+This is the current detect-only monitoring path for active-inference runtime.
+
+### Detection Pipeline (Per Step)
+
+```mermaid
+flowchart TD
+    A[agent.step in active_inference] --> B[infer_beliefs]
+    B --> C[update obs_confidence]
+    C --> D[phase transition gates use confidence]
+    D --> E[select_action]
+    E --> F[_update_ai_risk_detection]
+    F --> G[risk state fields updated]
+    G --> H[_log_heartbeat]
+    H --> I[_log_events]
+```
+
+### Confidence and Release Verification
+
+```mermaid
+flowchart TD
+    A[New observation] --> B[obj jump, target jump, contact flip]
+    B --> C[raw confidence score]
+    C --> D[EMA smoothing -> obs_confidence]
+    D --> E{obs_confidence >= confidence_min_for_phase_change}
+    E -->|yes| F[allow phase transition gates]
+    E -->|no| G[hold current phase]
+
+    O[phase == Open] --> O1{contact == 1}
+    O1 -->|yes| O2[release_contact_counter++]
+    O1 -->|no| O3[counter reset to 0]
+    O2 --> O4{counter >= release_contact_warn_steps}
+    O4 -->|yes| O5[release_warning = 1]
+```
+
+### Risk Detection (Detect-Only)
+
+```mermaid
+flowchart TD
+    A[controller debug norms] --> B[dq_ratio = dq_raw / dq_applied]
+    C[phase error progress] --> D[phase_no_progress_steps]
+    B --> E{dq_ratio high AND no progress}
+    D --> E
+    E -->|yes| F[singularity_counter++]
+    E -->|no| G[counter reset]
+    F --> H{counter >= singularity_no_progress_steps}
+    H -->|yes| I[singularity_warn=1]
+
+    J[current phase + contact] --> K[unexpected_contact?]
+    K -->|yes| L[unintended_contact_counter++]
+    K -->|no| M[counter reset]
+    L --> N{counter >= unintended_contact_warn_steps}
+    N -->|yes| O[unintended_contact_warn=1]
+```
+
+### Important Note
+- Current behavior is detect-only.
+- No forced emergency transition is triggered from these warnings.
+- Warnings are surfaced in heartbeat/event logs for analysis and later recovery policy design.
 
 ## What Is Still Missing for Real-Robot Quality
 
@@ -90,4 +150,3 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
 3. Add confidence gating around phase transitions.
 4. Add collision/singularity fallback branch in BT.
 5. Start hardware-in-the-loop timing and latency tests.
-

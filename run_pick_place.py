@@ -115,18 +115,15 @@ def main():
     SENSOR_CONFIG_PATH = "config/sensor_config.yaml"
     SAFETY_CONFIG_PATH = "config/safety_config.yaml"
     COMMON_CONFIG_PATH = os.getenv("COMMON_CONFIG_PATH", "config/common_robot.yaml")
-    FSM_CONFIG_PATH = os.getenv("FSM_CONFIG_PATH", "config/fsm_config.yaml")
     ACTIVE_INFERENCE_CONFIG_PATH = os.getenv(
         "ACTIVE_INFERENCE_CONFIG_PATH", "config/active_inference_config.yaml"
     )
     runtime_cfg = load_runtime_sections(
         common_path=COMMON_CONFIG_PATH,
-        fsm_path=FSM_CONFIG_PATH,
         active_inference_path=ACTIVE_INFERENCE_CONFIG_PATH,
     )
     run_cfg = runtime_cfg["run_cfg"]
     LOG_EVERY_STEPS = int(run_cfg["log_every_steps"])
-    CONTROL_MODE = str(run_cfg["control_mode"]).strip().lower()
     shared_task_cfg = runtime_cfg.get("shared_task_cfg", {})
 
     if args.no_pause or args.record_video:
@@ -184,10 +181,7 @@ def main():
         simulator=simulator,
         sensor_backend=sensor_backend,
         actuator_backend=actuator_backend,
-        control_mode=CONTROL_MODE,
         log_every_steps=LOG_EVERY_STEPS,
-        task_cfg=runtime_cfg["task_cfg"],
-        policy_cfg=runtime_cfg["policy_cfg"],
         active_inference_cfg=active_cfg,
     )
 
@@ -196,7 +190,7 @@ def main():
     # ------------------------------------------------
     print("Starting Active Inference Pick-and-Place demo...")
     print("Press Ctrl+C to stop.")
-    print(f"Control mode: {CONTROL_MODE}")
+    print("Control mode: active_inference (fixed)")
     print(f"Render viewer: {int(render)}")
     if args.record_video:
         print(f"Recording: {args.record_video}")
@@ -209,7 +203,6 @@ def main():
     )
     print(
         f"Configs: common={runtime_cfg['common_path']} "
-        f"fsm={runtime_cfg['fsm_path']} "
         f"active_inference={runtime_cfg['active_inference_path']} "
         f"(found={int(runtime_cfg['found'])}, strict={int(runtime_cfg.get('strict', False))})"
     )

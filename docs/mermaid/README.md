@@ -2,16 +2,11 @@
 
 Generated from Markdown Mermaid blocks.
 
-- Source root: `D:\Coding\Omnibio\active_inference_pick_place`
-- Total `.mmd` files: `8`
+- Source root: repository `docs/` Markdown files
+- Total `.mmd` files: `3`
 
 ## Files
 
-- `docs/mermaid/docs/ai_failure_detection_flow_01.mmd`
-- `docs/mermaid/docs/ai_failure_detection_flow_02.mmd`
-- `docs/mermaid/docs/ai_failure_detection_flow_03.mmd`
-- `docs/mermaid/docs/fsm_state_flow_diagram_01.mmd`
-- `docs/mermaid/docs/runtime_system_flow_01.mmd`
-- `docs/mermaid/docs/runtime_system_flow_02.mmd`
-- `docs/mermaid/docs/runtime_system_flow_03.mmd`
-- `docs/mermaid/docs/runtime_system_flow_04.mmd`
+- `docs/mermaid/docs/ai_bt_architecture_01.mmd`
+- `docs/mermaid/docs/ai_bt_architecture_02.mmd`
+- `docs/mermaid/docs/ai_bt_architecture_03.mmd`

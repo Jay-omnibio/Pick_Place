@@ -1,9 +1,8 @@
 run:
-  control_mode: active_inference # active_inference or fsm
   log_every_steps: 100
 
 task_shared:
-  # Shared place-goal pose used by both FSM and Active Inference.
+  # Shared place-goal pose used by active inference runtime.
   # - target_world_xyz drives simulator target site (red marker).
   # - target_world_yaw_deg is used by AI place yaw logic.
   # Optional full pose overrides xyz+yaw when provided.
