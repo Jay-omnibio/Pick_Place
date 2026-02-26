@@ -9,6 +9,7 @@
 - `inference_interface.py`: belief update integration point.
 - `inference/action_selection.py`: action selection logic.
 - `inference/action_selection.jl`: optional Julia path.
+- `inference/rxinfer_beliefs.jl`: optional RxInfer belief update path.
 
 ## Robot Interface and Control
 - `backends/sensor_backend.py`: sensor abstraction.
@@ -31,4 +32,10 @@
 ## Diagnostics
 - `tools/plot_run_metrics.py`: run plotting utility.
 - `tools/analyze_run_diagnostics.py`: run diagnostics.
+- `tools/run_batch_eval.py`: batch episode evaluator.
+- `tools/run_position_sweep.py`: multi-scenario object-pose sweep runner.
 - `logs/`: generated CSVs and plots.
+
+## Design Notes
+- `docs/ai_bt_partwise_findings.md`: deep part-by-part status review and priorities.
+- `docs/non_direct_path_compensations.md`: map of non-direct-path behavior logic and tuning knobs.

@@ -29,10 +29,14 @@ controller:
   topdown_weight: 0.60
   topdown_weight_grasp: 1.20
   tool_axis: 2
-  gripper_open_width: 0.060
+  gripper_open_width: 0.08 #0.060 changed
   gripper_close_width: 0.0
+  gripper_size_based_open: true
+  gripper_open_clearance: 0.030 # additional clearance added to object size for open width when size-based
+  gripper_open_min_width: 0.030 # minimum open width to avoid collisions during approach
+  gripper_open_unknown_full_open: true
   gripper_rate: 0.045
-  gripper_width_tol: 0.0015
-  gripper_speed_tol: 0.002
+  gripper_width_tol: 0.0015 #
+  gripper_speed_tol: 0.002  #
   gripper_switch_cooldown_steps: 6
   debug_every_steps: 100

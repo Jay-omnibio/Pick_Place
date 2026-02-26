@@ -34,8 +34,9 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
 
 ### Transition Quality Gates
 - Reach/descend gates use configured thresholds and timers.
-- Place-open gate is strict axis-based:
-  - `place_xy_ok AND place_z_ok`
+- Place-open gate is strict axis-based plus optional yaw and confidence/VFE gate:
+  - `place_xy_ok AND place_z_ok AND place_yaw_ok AND phase_gate_ok`
+- Open-ready checks are gripper-target aware (runtime sync with controller dynamic open target).
 - BT stall detection is progress-aware:
   - checks phase error improvement, not only raw time in phase.
 
@@ -53,6 +54,7 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
 1. Sensor observation (`o_ee`, `o_obj`, `o_target`, `o_grip`, `o_contact`).
 2. `infer_beliefs(...)` updates:
    - `s_ee_mean`, `s_obj_mean`, `s_target_mean`, phase state, timers.
+   - Belief backend: Python EMA baseline or optional RxInfer-backed update.
 3. BT ticks on current belief:
    - keep running, recover, or terminal.
 4. `select_action(...)` outputs control command for current phase.

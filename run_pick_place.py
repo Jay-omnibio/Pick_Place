@@ -48,13 +48,13 @@ def _parse_args():
     parser.add_argument(
         "--record-width",
         type=int,
-        default=960,
+        default=640,
         help="Recorder frame width.",
     )
     parser.add_argument(
         "--record-height",
         type=int,
-        default=540,
+        default=480,
         help="Recorder frame height.",
     )
     parser.add_argument(
@@ -109,6 +109,20 @@ def _resolve_shared_target_pose(shared_task_cfg):
     return target_xyz.copy(), target_yaw_deg, (None if pose6 is None else pose6.copy())
 
 
+def _parse_env_vec(name: str, length: int):
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return None
+    norm = raw.replace(";", ",")
+    parts = [p.strip() for p in norm.split(",") if p.strip()]
+    if len(parts) != int(length):
+        raise ValueError(f"{name} must contain exactly {length} comma-separated values.")
+    vec = np.asarray([float(p) for p in parts], dtype=float).reshape(-1)
+    if vec.shape[0] != int(length) or not np.all(np.isfinite(vec)):
+        raise ValueError(f"{name} must contain finite numeric values.")
+    return vec
+
+
 def main():
     args = _parse_args()
     MODEL_XML_PATH = "assets/pick_and_place.xml"
@@ -144,6 +158,13 @@ def main():
         record_every_steps=args.record_every_steps,
         record_camera=args.record_camera,
     )
+    obj_world_xyz = _parse_env_vec("OBJ_WORLD_XYZ", 3)
+    obj_world_quat = _parse_env_vec("OBJ_WORLD_QUAT_WXYZ", 4)
+    if obj_world_xyz is not None or obj_world_quat is not None:
+        if obj_world_xyz is None:
+            obj_world_xyz = np.asarray(simulator.get_object_position(), dtype=float).reshape(3)
+        simulator.set_object_pose(obj_world_xyz, quat_wxyz=obj_world_quat)
+
     shared_target_xyz, shared_target_yaw_deg, shared_target_pose6 = _resolve_shared_target_pose(
         shared_task_cfg
     )
@@ -212,6 +233,15 @@ def main():
         f"yaw_deg={float(shared_target_yaw_deg):.1f} "
         f"source={shared_target_source}"
     )
+    if obj_world_xyz is not None or obj_world_quat is not None:
+        obj_pos = np.asarray(simulator.get_object_position(), dtype=float).reshape(3)
+        obj_quat = np.asarray(simulator.get_object_orientation_quat(), dtype=float).reshape(4)
+        print(
+            "[Config-Object] world_pos="
+            f"[{obj_pos[0]:+.3f},{obj_pos[1]:+.3f},{obj_pos[2]:+.3f}] "
+            f"quat_wxyz=[{obj_quat[0]:+.4f},{obj_quat[1]:+.4f},{obj_quat[2]:+.4f},{obj_quat[3]:+.4f}] "
+            "source=env"
+        )
     for line in agent.runtime_debug_lines():
         print(line)
 

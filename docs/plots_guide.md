@@ -145,7 +145,7 @@ How to interpret:
 
 Good trend:
 - Reach: mostly movement commands.
-- Grasp: `action_grip` goes to `1`, movement becomes small/targeted.
+- Descend/CloseHold: `action_grip` goes to `1`, movement becomes small/targeted.
 - Lift: positive `action_move_z` with `action_grip=1`.
 
 Warning signs:
@@ -174,7 +174,7 @@ Warning signs:
 
 ## 6) `06_phase_contact_gripper.png` - Phase, Contact, Gripper Observation
 Lines:
-- `phase`: task phase index (ytick labels show names like Reach/Grasp/Lift/Place).
+- `phase`: task phase index (ytick labels follow current AI pipeline such as Reach/Align/Descend/LiftTest/Transit/MoveToPlaceAbove/...).
 - `obs_contact`: binary contact observation.
   - `1` means contact detected.
 - `escape_active`: recovery state flag.
@@ -193,7 +193,7 @@ Good trend:
 
 Warning signs:
 - Stuck in Reach for long runs.
-- Frequent Reach<->Grasp bouncing without lift.
+- Frequent Reach<->Align loops without reaching `CloseHold`.
 - Continuous recovery activation.
 
 ---
@@ -256,7 +256,7 @@ Good trend:
 
 ## 11) `11_reach_path_xy.png` - Pick-Side XY Path (Start To Descend End)
 Panels:
-- Left: world XY path from first Reach/ReachAbove start to end of first Descend
+- Left: world XY path from first Reach start to end of first Descend
   - `true_ee_xy`, `obs_ee_xy`, optional `belief_ee_xy`
 - Right: object-relative XY path during the same pick-side window
   - `obs_obj_rel_xy`, optional `belief_obj_rel_xy`, `reach_ref_rel_xy`, `desc_ref_rel_xy`
@@ -285,7 +285,7 @@ Why it helps:
 - Lets you compare repeated attempts of the same phase directly (for example first `Reach` vs retry `Reach`).
 
 Typical metrics per phase:
-- Reach/ReachAbove: `obs_reach_xy_error`, `obs_reach_z_error`
+- Reach: `obs_reach_xy_error`, `obs_reach_z_error`
 - Align/PreGraspHold/Descend/CloseHold/LiftTest: `obs_descend_xy_error`, `obs_descend_z_error`
 - MoveToPlaceAbove: `obs_preplace_error`, `obs_preplace_xy_error`
 - DescendToPlace/Open/Retreat/Done: `obs_place_error`, `obs_place_xy_error`

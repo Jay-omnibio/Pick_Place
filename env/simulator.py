@@ -65,6 +65,9 @@ class MujocoSimulator:
             self._get_joint_id("finger_joint1"),
             self._get_joint_id("finger_joint2"),
         ]
+        self.obj_joint_id = self._get_joint_id("obj_joint")
+        self.obj_joint_qpos_addr = self.model.jnt_qposadr[self.obj_joint_id]
+        self.obj_joint_dof_addr = self.model.jnt_dofadr[self.obj_joint_id]
         self.joint7_id = self._get_joint_id("joint7")
         self.joint7_qpos_addr = self.model.jnt_qposadr[self.joint7_id]
         self.gripper_qpos_addr = [
@@ -325,6 +328,75 @@ class MujocoSimulator:
     def get_object_orientation_quat(self):
         # World orientation of object body as quaternion [w, x, y, z].
         return self.data.xquat[self.obj_body_id].copy()
+
+    def set_object_pose(self, position, quat_wxyz=None):
+        """
+        Set free-joint object world pose.
+        position: [x,y,z]
+        quat_wxyz: [w,x,y,z] (optional, keep current if None)
+        """
+        pos = np.asarray(position, dtype=float).reshape(3)
+        if not np.all(np.isfinite(pos)):
+            raise ValueError("Object position must contain finite values.")
+
+        if quat_wxyz is None:
+            quat = np.asarray(self.get_object_orientation_quat(), dtype=float).reshape(4)
+        else:
+            quat = np.asarray(quat_wxyz, dtype=float).reshape(4)
+        if not np.all(np.isfinite(quat)):
+            raise ValueError("Object quaternion must contain finite values.")
+        qn = float(np.linalg.norm(quat))
+        if qn <= 1e-9:
+            raise ValueError("Object quaternion norm must be non-zero.")
+        quat = quat / qn
+
+        if int(self.model.jnt_type[self.obj_joint_id]) != int(mujoco.mjtJoint.mjJNT_FREE):
+            raise ValueError("Object joint 'obj_joint' is not a free joint.")
+
+        qaddr = int(self.obj_joint_qpos_addr)
+        daddr = int(self.obj_joint_dof_addr)
+        self.data.qpos[qaddr : qaddr + 3] = pos
+        self.data.qpos[qaddr + 3 : qaddr + 7] = quat
+        self.data.qvel[daddr : daddr + 6] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+
+    def get_object_grasp_width_estimate(self):
+        """
+        Estimate object lateral grasp width from object body geoms.
+        Returns conservative width in meters, or NaN when unavailable.
+        """
+        geom_start = int(self.model.body_geomadr[self.obj_body_id])
+        geom_count = int(self.model.body_geomnum[self.obj_body_id])
+        if geom_count <= 0:
+            return float("nan")
+
+        widths = []
+        for gid in range(geom_start, geom_start + geom_count):
+            gtype = int(self.model.geom_type[gid])
+            gsize = np.asarray(self.model.geom_size[gid], dtype=float).reshape(-1)
+            width = float("nan")
+
+            if gtype == int(mujoco.mjtGeom.mjGEOM_BOX):
+                # Top-down pinch width from larger planar half-extent.
+                width = 2.0 * float(max(gsize[0], gsize[1]))
+            elif gtype in (int(mujoco.mjtGeom.mjGEOM_SPHERE), int(mujoco.mjtGeom.mjGEOM_CYLINDER)):
+                width = 2.0 * float(gsize[0])
+            elif gtype == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+                width = 2.0 * float(gsize[0])
+            elif gtype == int(mujoco.mjtGeom.mjGEOM_ELLIPSOID):
+                width = 2.0 * float(max(gsize[0], gsize[1]))
+            else:
+                # Fallback for mesh/other: use bounding sphere diameter.
+                rbound = float(self.model.geom_rbound[gid])
+                if np.isfinite(rbound) and rbound > 0.0:
+                    width = 2.0 * rbound
+
+            if np.isfinite(width) and width > 0.0:
+                widths.append(float(width))
+
+        if not widths:
+            return float("nan")
+        return float(max(widths))
 
     # ------------------------------------------------
     # Target (place site)

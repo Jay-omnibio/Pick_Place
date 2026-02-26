@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import numpy as np
 
 """
@@ -6,9 +9,131 @@ This module bridges Python to Julia (RxInfer).
 Responsibilities:
 - maintain belief state
 - convert observations into inference inputs
-- call RxInfer (later)
+- optionally call RxInfer-backed belief update
+- fallback safely to Python belief update when Julia/RxInfer is unavailable
 - return belief dictionary usable by action selection
 """
+
+# Optional Julia/RxInfer backend for belief updates.
+# The runtime always has a pure-Python fallback path.
+try:
+    from julia import Main as _jl
+
+    _inference_dir = str((Path(__file__).resolve().parent / "inference").as_posix())
+    _jl.eval(f'pushfirst!(LOAD_PATH, "{_inference_dir}")')
+    _jl.include(str((Path(__file__).resolve().parent / "inference" / "rxinfer_beliefs.jl").as_posix()))
+    _RXINFER_JULIA_AVAILABLE = hasattr(_jl, "rxinfer_belief_step")
+    _RXINFER_JULIA_ERROR = ""
+except Exception as exc:
+    _jl = None
+    _RXINFER_JULIA_AVAILABLE = False
+    _RXINFER_JULIA_ERROR = f"{type(exc).__name__}: {exc}"
+    if os.getenv("ACTIVE_INFERENCE_VERBOSE_JULIA", "0") == "1":
+        print(
+            "Warning: RxInfer Julia initialization failed; "
+            f"falling back to Python belief updates ({_RXINFER_JULIA_ERROR})."
+        )
+
+_RXINFER_RUNTIME_DISABLED = False
+
+
+def _rxinfer_step(
+    previous_belief: dict,
+    *,
+    ee_obs: np.ndarray,
+    obj_obs: np.ndarray,
+    target_obs: np.ndarray,
+    ee_vel: np.ndarray,
+    obj_vel: np.ndarray,
+    target_vel: np.ndarray,
+    dt: float,
+    process_noise_ee: float,
+    process_noise_obj: float,
+    process_noise_target: float,
+    obs_noise_ee: float,
+    obs_noise_obj: float,
+    obs_noise_target: float,
+    min_variance: float,
+) -> dict | None:
+    """
+    One-step RxInfer-backed belief update.
+    Returns None when backend is unavailable or failed, so caller can fallback.
+    """
+    global _RXINFER_RUNTIME_DISABLED
+
+    if (not _RXINFER_JULIA_AVAILABLE) or _RXINFER_RUNTIME_DISABLED or _jl is None:
+        return None
+
+    try:
+        prev_ee_mean = np.asarray(previous_belief.get("s_ee_mean", np.zeros(3)), dtype=float).reshape(3)
+        prev_obj_mean = np.asarray(previous_belief.get("s_obj_mean", np.zeros(3)), dtype=float).reshape(3)
+        prev_target_mean = np.asarray(previous_belief.get("s_target_mean", np.zeros(3)), dtype=float).reshape(3)
+        prev_ee_cov = np.asarray(previous_belief.get("s_ee_cov", np.eye(3)), dtype=float)
+        prev_obj_cov = np.asarray(previous_belief.get("s_obj_cov", np.eye(3)), dtype=float)
+        prev_target_cov = np.asarray(previous_belief.get("s_target_cov", np.eye(3)), dtype=float)
+        prev_ee_cov_diag = np.diag(prev_ee_cov) if prev_ee_cov.ndim == 2 else prev_ee_cov.reshape(3)
+        prev_obj_cov_diag = np.diag(prev_obj_cov) if prev_obj_cov.ndim == 2 else prev_obj_cov.reshape(3)
+        prev_target_cov_diag = (
+            np.diag(prev_target_cov) if prev_target_cov.ndim == 2 else prev_target_cov.reshape(3)
+        )
+
+        result = _jl.rxinfer_belief_step(
+            prev_ee_mean.tolist(),
+            prev_obj_mean.tolist(),
+            prev_target_mean.tolist(),
+            np.asarray(prev_ee_cov_diag, dtype=float).reshape(3).tolist(),
+            np.asarray(prev_obj_cov_diag, dtype=float).reshape(3).tolist(),
+            np.asarray(prev_target_cov_diag, dtype=float).reshape(3).tolist(),
+            np.asarray(ee_obs, dtype=float).reshape(3).tolist(),
+            np.asarray(obj_obs, dtype=float).reshape(3).tolist(),
+            np.asarray(target_obs, dtype=float).reshape(3).tolist(),
+            np.asarray(ee_vel, dtype=float).reshape(3).tolist(),
+            np.asarray(obj_vel, dtype=float).reshape(3).tolist(),
+            np.asarray(target_vel, dtype=float).reshape(3).tolist(),
+            float(dt),
+            float(process_noise_ee),
+            float(process_noise_obj),
+            float(process_noise_target),
+            float(obs_noise_ee),
+            float(obs_noise_obj),
+            float(obs_noise_target),
+            float(min_variance),
+        )
+
+        s_ee_mean = np.asarray(result.ee_mean, dtype=float).reshape(3)
+        s_obj_mean = np.asarray(result.obj_mean, dtype=float).reshape(3)
+        s_target_mean = np.asarray(result.target_mean, dtype=float).reshape(3)
+        s_ee_cov_diag = np.asarray(result.ee_cov_diag, dtype=float).reshape(3)
+        s_obj_cov_diag = np.asarray(result.obj_cov_diag, dtype=float).reshape(3)
+        s_target_cov_diag = np.asarray(result.target_cov_diag, dtype=float).reshape(3)
+
+        if not (
+            np.all(np.isfinite(s_ee_mean))
+            and np.all(np.isfinite(s_obj_mean))
+            and np.all(np.isfinite(s_target_mean))
+            and np.all(np.isfinite(s_ee_cov_diag))
+            and np.all(np.isfinite(s_obj_cov_diag))
+            and np.all(np.isfinite(s_target_cov_diag))
+        ):
+            return None
+
+        return {
+            "s_ee_mean": s_ee_mean.copy(),
+            "s_obj_mean": s_obj_mean.copy(),
+            "s_target_mean": s_target_mean.copy(),
+            "s_ee_cov": np.diag(np.maximum(s_ee_cov_diag, float(min_variance))),
+            "s_obj_cov": np.diag(np.maximum(s_obj_cov_diag, float(min_variance))),
+            "s_target_cov": np.diag(np.maximum(s_target_cov_diag, float(min_variance))),
+            "backend_name": str(getattr(result, "backend_name", "rxinfer")),
+        }
+    except Exception as exc:
+        _RXINFER_RUNTIME_DISABLED = True
+        if os.getenv("ACTIVE_INFERENCE_VERBOSE_JULIA", "0") == "1":
+            print(
+                "Warning: RxInfer belief step failed at runtime; "
+                f"disabling RxInfer and falling back to Python ({type(exc).__name__}: {exc})."
+            )
+        return None
 
 
 def _require_param(params, key):
@@ -259,6 +384,13 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     place_threshold = float(_require_param(params, "place_threshold"))
     preplace_xy_threshold = float(_require_param(params, "preplace_xy_threshold"))
     preplace_z_threshold = float(_require_param(params, "preplace_z_threshold"))
+    preplace_max_steps = int(_require_param(params, "preplace_max_steps"))
+    preplace_progress_eps = float(_require_param(params, "preplace_progress_eps"))
+    preplace_stall_steps = int(_require_param(params, "preplace_stall_steps"))
+    preplace_timeout_extension_steps = int(_require_param(params, "preplace_timeout_extension_steps"))
+    preplace_max_timeout_extensions = int(_require_param(params, "preplace_max_timeout_extensions"))
+    preplace_timeout_xy_threshold = float(_require_param(params, "preplace_timeout_xy_threshold"))
+    preplace_timeout_z_threshold = float(_require_param(params, "preplace_timeout_z_threshold"))
     place_xy_threshold = float(_require_param(params, "place_xy_threshold"))
     place_z_threshold = float(_require_param(params, "place_z_threshold"))
     place_descend_max_steps = int(_require_param(params, "place_descend_max_steps"))
@@ -281,6 +413,16 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     grip_close_target = float(_require_param(params, "grip_close_target"))
     grip_ready_width_tol = float(_require_param(params, "grip_ready_width_tol"))
     grip_ready_speed_tol = float(_require_param(params, "grip_ready_speed_tol"))
+
+    # Optional stronger belief-update path (RxInfer via Julia).
+    rxinfer_enabled = bool(params.get("rxinfer_enabled", False))
+    rxinfer_process_noise_ee = float(params.get("rxinfer_process_noise_ee", 0.0025))
+    rxinfer_process_noise_obj = float(params.get("rxinfer_process_noise_obj", 0.0040))
+    rxinfer_process_noise_target = float(params.get("rxinfer_process_noise_target", 0.0020))
+    rxinfer_obs_noise_ee = float(params.get("rxinfer_obs_noise_ee", 0.0016))
+    rxinfer_obs_noise_obj = float(params.get("rxinfer_obs_noise_obj", 0.0036))
+    rxinfer_obs_noise_target = float(params.get("rxinfer_obs_noise_target", 0.0025))
+    rxinfer_min_variance = float(params.get("rxinfer_min_variance", 1e-6))
 
     # Initial belief (t = 0)
     if previous_belief is None:
@@ -421,10 +563,16 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "release_detach_counter": 0,
             "release_stable_counter": 0,
             "release_reapproach_count": 0,
+            "gripper_open_ready": 1,
+            "gripper_close_ready": 0,
             "place_descend_timer": 0,
             "place_descend_best_error": float("inf"),
             "place_descend_no_progress_steps": 0,
             "place_descend_timeout_extensions": 0,
+            "preplace_timer": 0,
+            "preplace_best_error": float("inf"),
+            "preplace_no_progress_steps": 0,
+            "preplace_timeout_extensions": 0,
             "place_reapproach_count": 0,
             "recovery_branch": "",
             "recovery_branch_retry": 0,
@@ -438,6 +586,9 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "retry_count": 0,
             "last_retry_reason": "",
             "failure_reason": "",
+            "belief_update_backend": "python_init",
+            "rxinfer_enabled": int(bool(rxinfer_enabled)),
+            "rxinfer_available": int(bool(_RXINFER_JULIA_AVAILABLE and not _RXINFER_RUNTIME_DISABLED)),
         }
 
     reach_obj_rel_local = reach_obj_rel_local_cfg.copy()
@@ -467,8 +618,10 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         place_target_rel = _maybe_override_ref(["place_target_rel"], place_target_rel)
         retreat_move = _maybe_override_ref(["retreat_move"], retreat_move)
 
-    # Placeholder inference update (to be replaced by RxInfer call)
-    # Use estimator outputs + short-horizon prediction to reduce sensing lag.
+    # Belief update path:
+    # - default: Python EMA fusion (baseline behavior)
+    # - optional: RxInfer-backed one-step Bayesian update (Julia), then smoothed
+    #   with the same alpha gains for compatibility with current phase logic.
     ee_obs = _safe_vec3(observation.get("o_ee", [0.0, 0.0, 0.0]))
     obj_obs_raw = _safe_vec3(observation.get("o_obj", [0.0, 0.0, 0.0]))
     if use_world_place_goal_pose:
@@ -495,10 +648,10 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     if not np.all(np.isfinite(target_obs)):
         target_obs = target_est.copy()
 
-    s_ee_mean = alpha_ee * ee_obs + (1 - alpha_ee) * previous_belief["s_ee_mean"]
-
     prev_phase = previous_belief["phase"]
     prev_obj = np.asarray(previous_belief["s_obj_mean"], dtype=float).reshape(3)
+    prev_ee = np.asarray(previous_belief["s_ee_mean"], dtype=float).reshape(3)
+    prev_target = np.asarray(previous_belief["s_target_mean"], dtype=float).reshape(3)
     obj_yaw_obs = float(observation.get("o_obj_yaw", 0.0))
     if not np.isfinite(obj_yaw_obs):
         obj_yaw_obs = 0.0
@@ -507,10 +660,53 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     if obj_jump > obj_reacquire_jump:
         # Fast object motion (fall/slide): trust current observation more.
         alpha_obj = max(alpha_obj, 0.95)
-    s_obj_mean = alpha_obj * obj_obs + (1 - alpha_obj) * prev_obj
-    s_target_mean = (
-        alpha_target * target_obs + (1 - alpha_target) * previous_belief["s_target_mean"]
-    )
+    s_ee_cov = np.asarray(previous_belief["s_ee_cov"], dtype=float)
+    s_obj_cov = np.asarray(previous_belief["s_obj_cov"], dtype=float)
+    s_target_cov = np.asarray(previous_belief["s_target_cov"], dtype=float)
+    belief_update_backend = "python_ema"
+
+    # Increase process noise during strong object jumps so RxInfer can reacquire faster.
+    rxinfer_obj_process_noise = float(rxinfer_process_noise_obj)
+    if obj_jump > obj_reacquire_jump:
+        rxinfer_obj_process_noise = max(
+            rxinfer_obj_process_noise,
+            float(rxinfer_process_noise_obj) * 2.5,
+        )
+
+    rxinfer_state = None
+    if rxinfer_enabled:
+        rxinfer_state = _rxinfer_step(
+            previous_belief,
+            ee_obs=ee_obs,
+            obj_obs=obj_obs,
+            target_obs=target_obs,
+            ee_vel=ee_vel,
+            obj_vel=obj_vel,
+            target_vel=target_vel,
+            dt=predict_horizon,
+            process_noise_ee=rxinfer_process_noise_ee,
+            process_noise_obj=rxinfer_obj_process_noise,
+            process_noise_target=rxinfer_process_noise_target,
+            obs_noise_ee=rxinfer_obs_noise_ee,
+            obs_noise_obj=rxinfer_obs_noise_obj,
+            obs_noise_target=rxinfer_obs_noise_target,
+            min_variance=rxinfer_min_variance,
+        )
+
+    if rxinfer_state is not None:
+        # Keep existing alpha gains to preserve established phase behavior.
+        s_ee_mean = alpha_ee * rxinfer_state["s_ee_mean"] + (1 - alpha_ee) * prev_ee
+        s_obj_mean = alpha_obj * rxinfer_state["s_obj_mean"] + (1 - alpha_obj) * prev_obj
+        s_target_mean = alpha_target * rxinfer_state["s_target_mean"] + (1 - alpha_target) * prev_target
+        s_ee_cov = np.asarray(rxinfer_state["s_ee_cov"], dtype=float)
+        s_obj_cov = np.asarray(rxinfer_state["s_obj_cov"], dtype=float)
+        s_target_cov = np.asarray(rxinfer_state["s_target_cov"], dtype=float)
+        belief_update_backend = str(rxinfer_state.get("backend_name", "rxinfer"))
+    else:
+        s_ee_mean = alpha_ee * ee_obs + (1 - alpha_ee) * prev_ee
+        s_obj_mean = alpha_obj * obj_obs + (1 - alpha_obj) * prev_obj
+        s_target_mean = alpha_target * target_obs + (1 - alpha_target) * prev_target
+
     prev_approach_side_sign = float(previous_belief.get("approach_side_sign", 1.0))
     approach_side_sign = _compute_approach_side_sign(
         s_ee_mean=np.asarray(s_ee_mean, dtype=float),
@@ -529,8 +725,6 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     reach_obj_rel = _obj_local_rel_to_world(reach_local_signed, obj_yaw_obs)
     align_obj_rel = _obj_local_rel_to_world(align_local_signed, obj_yaw_obs)
     descend_obj_rel = _obj_local_rel_to_world(descend_local, obj_yaw_obs)
-    s_obj_cov = previous_belief["s_obj_cov"]
-    s_target_cov = previous_belief["s_target_cov"]
     prev_o_obj = np.asarray(previous_belief.get("prev_o_obj", obj_obs), dtype=float)
     prev_o_target = np.asarray(
         previous_belief.get("prev_o_target", target_obs),
@@ -647,6 +841,10 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     place_descend_best_error = float(previous_belief.get("place_descend_best_error", float("inf")))
     place_descend_no_progress_steps = int(previous_belief.get("place_descend_no_progress_steps", 0))
     place_descend_timeout_extensions = int(previous_belief.get("place_descend_timeout_extensions", 0))
+    preplace_timer = int(previous_belief.get("preplace_timer", 0))
+    preplace_best_error = float(previous_belief.get("preplace_best_error", float("inf")))
+    preplace_no_progress_steps = int(previous_belief.get("preplace_no_progress_steps", 0))
+    preplace_timeout_extensions = int(previous_belief.get("preplace_timeout_extensions", 0))
     place_reapproach_count = int(previous_belief.get("place_reapproach_count", 0))
     recovery_branch = str(previous_belief.get("recovery_branch", ""))
     recovery_branch_retry = int(previous_belief.get("recovery_branch_retry", 0))
@@ -716,17 +914,22 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         r_ee = float(np.linalg.norm(ee_xy))
         r_goal = float(np.linalg.norm(goal_xy))
         arc_radius_gate = max(0.05, float(reach_arc_min_radius))
+        # Disable arc when sufficiently near in XY so final approach is linear.
+        # This preserves arc for far/side cases but avoids late sideways motion.
+        arc_disable_xy = float(max(reach_yaw_align_xy_enter, 0.6 * reach_enter_threshold))
         if r_ee >= arc_radius_gate and r_goal >= arc_radius_gate:
             theta_ee = float(np.arctan2(ee_xy[1], ee_xy[0]))
             theta_goal = float(np.arctan2(goal_xy[1], goal_xy[0]))
             dtheta_short = _wrap_to_pi(theta_goal - theta_ee)
             trigger = float(np.deg2rad(reach_arc_angle_trigger_deg))
             release = float(np.deg2rad(reach_arc_release_deg))
-            if reach_turn_sign == 0 and abs(dtheta_short) >= trigger:
+            if reach_turn_sign == 0 and abs(dtheta_short) >= trigger and xy_err > arc_disable_xy:
                 reach_turn_sign = 1 if dtheta_short >= 0.0 else -1
             elif reach_turn_sign != 0 and abs(dtheta_short) <= release:
                 reach_turn_sign = 0
         else:
+            reach_turn_sign = 0
+        if xy_err <= arc_disable_xy:
             reach_turn_sign = 0
 
         # Reach progress watchdog: if no improvement for long, trigger linear fallback.
@@ -1125,6 +1328,10 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         if ee_z >= (transit_height - transit_z_threshold):
             phase = "MoveToPlaceAbove"
             last_retry_reason = ""
+            preplace_timer = 0
+            preplace_best_error = float("inf")
+            preplace_no_progress_steps = 0
+            preplace_timeout_extensions = 0
         elif s_grasp == 0:
             phase = "Reach"
             last_retry_reason = "grasp_failed"
@@ -1150,17 +1357,61 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         reach_yaw_align_active = 0
         reach_yaw_align_timer = 0
         reach_yaw_align_done = 0
+        preplace_timer += 1
         err = s_target_mean - preplace_target_rel
+        preplace_err = float(np.linalg.norm(err))
+        preplace_xy_err = float(np.linalg.norm(err[:2]))
+        preplace_z_err = abs(float(err[2]))
         preplace_xy_ok = float(np.linalg.norm(err[:2])) <= preplace_xy_threshold
         preplace_z_ok = abs(float(err[2])) <= preplace_z_threshold
-        if (preplace_xy_ok and preplace_z_ok) and phase_gate_ok:
+
+        if not np.isfinite(preplace_best_error):
+            preplace_best_error = preplace_err
+            preplace_no_progress_steps = 0
+        elif preplace_err < (preplace_best_error - preplace_progress_eps):
+            preplace_best_error = preplace_err
+            preplace_no_progress_steps = 0
+        else:
+            preplace_no_progress_steps += 1
+
+        timeout_hit = preplace_timer >= preplace_max_steps
+        timeout_near = (
+            preplace_xy_err <= preplace_timeout_xy_threshold
+            and preplace_z_err <= preplace_timeout_z_threshold
+        )
+        can_extend = (
+            timeout_hit
+            and not timeout_near
+            and preplace_timeout_extensions < preplace_max_timeout_extensions
+            and preplace_no_progress_steps < preplace_stall_steps
+        )
+
+        if ((preplace_xy_ok and preplace_z_ok) or (timeout_hit and timeout_near)) and phase_gate_ok:
             phase = "DescendToPlace"
             last_retry_reason = ""
             place_descend_timer = 0
             place_descend_best_error = float("inf")
             place_descend_no_progress_steps = 0
             place_descend_timeout_extensions = 0
+            preplace_timer = 0
+            preplace_best_error = float("inf")
+            preplace_no_progress_steps = 0
+            preplace_timeout_extensions = 0
             place_reapproach_count = 0
+        elif can_extend:
+            preplace_timeout_extensions += 1
+            preplace_timer = max(0, preplace_timer - preplace_timeout_extension_steps)
+            preplace_no_progress_steps = 0
+        elif timeout_hit:
+            last_retry_reason = "place_alignment_failed"
+            place_reapproach_count += 1
+            preplace_timer = 0
+            preplace_best_error = float("inf")
+            preplace_no_progress_steps = 0
+            preplace_timeout_extensions = 0
+            if place_reapproach_count > place_reapproach_max_retries:
+                phase = "Failure"
+                failure_reason = "place_alignment_failed"
         elif s_grasp == 0:
             phase = "Reach"
             last_retry_reason = "grasp_failed"
@@ -1178,6 +1429,10 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             retreat_timer = 0
             release_contact_counter = 0
             release_warning = 0
+            preplace_timer = 0
+            preplace_best_error = float("inf")
+            preplace_no_progress_steps = 0
+            preplace_timeout_extensions = 0
     elif phase == "DescendToPlace":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -1397,6 +1652,11 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         place_descend_best_error = float("inf")
         place_descend_no_progress_steps = 0
         place_descend_timeout_extensions = 0
+    if phase != "MoveToPlaceAbove":
+        preplace_timer = 0
+        preplace_best_error = float("inf")
+        preplace_no_progress_steps = 0
+        preplace_timeout_extensions = 0
 
     if phase in ("Reach", "Align", "PreGraspHold", "Descend", "CloseHold", "LiftTest", "Failure", "Done"):
         place_reapproach_count = 0
@@ -1449,7 +1709,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "place_goal_yaw_pi_symmetric": int(place_goal_yaw_pi_symmetric),
         "place_goal_yaw_error": float(place_yaw_error),
         "retreat_move": retreat_move.copy(),
-        "s_ee_cov": previous_belief["s_ee_cov"],
+        "s_ee_cov": s_ee_cov,
         "s_obj_cov": s_obj_cov,
         "s_target_cov": s_target_cov,
         "s_grasp": s_grasp,
@@ -1506,10 +1766,16 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "release_detach_counter": int(release_detach_counter),
         "release_stable_counter": int(release_stable_counter),
         "release_reapproach_count": int(release_reapproach_count),
+        "gripper_open_ready": int(gripper_open_ready),
+        "gripper_close_ready": int(gripper_close_ready),
         "place_descend_timer": int(place_descend_timer),
         "place_descend_best_error": float(place_descend_best_error),
         "place_descend_no_progress_steps": int(place_descend_no_progress_steps),
         "place_descend_timeout_extensions": int(place_descend_timeout_extensions),
+        "preplace_timer": int(preplace_timer),
+        "preplace_best_error": float(preplace_best_error),
+        "preplace_no_progress_steps": int(preplace_no_progress_steps),
+        "preplace_timeout_extensions": int(preplace_timeout_extensions),
         "place_reapproach_count": int(place_reapproach_count),
         "recovery_branch": str(recovery_branch),
         "recovery_branch_retry": int(recovery_branch_retry),
@@ -1523,4 +1789,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "retry_count": retry_count,
         "last_retry_reason": str(last_retry_reason),
         "failure_reason": str(failure_reason),
+        "belief_update_backend": str(belief_update_backend),
+        "rxinfer_enabled": int(bool(rxinfer_enabled)),
+        "rxinfer_available": int(bool(_RXINFER_JULIA_AVAILABLE and not _RXINFER_RUNTIME_DISABLED)),
     }

@@ -776,16 +776,25 @@ def _select_action_python(current_belief, params=None):
                 - preplace_target_rel
             ),
         )
+        # During large XY preplace error, prioritize translation by disabling
+        # orientation objectives that can create sideways/opposite motion.
+        orient_enable_xy = float(max(preplace_xy_threshold, 0.03))
+        orient_enable = bool(xy_err <= orient_enable_xy)
+        phase_scales = _phase_gain_scales("MoveToPlaceAbove")
+        if xy_err > orient_enable_xy:
+            phase_scales = dict(phase_scales)
+            phase_scales["position_gain_scale"] = float(max(1.0, phase_scales.get("position_gain_scale", 1.0)))
+            phase_scales["nullspace_gain_scale"] = float(max(1.0, phase_scales.get("nullspace_gain_scale", 1.0)))
         yaw_target = float(_place_yaw_target() if place_goal_yaw_enabled else _object_yaw_target())
         yaw_pi = bool(place_goal_yaw_pi_symmetric if place_goal_yaw_enabled else True)
         return {
             "move": desired.tolist(),
             "grip": 1,
-            "enable_yaw_objective": True,
+            "enable_yaw_objective": bool(orient_enable),
             "yaw_target": yaw_target,
             "yaw_pi_symmetric": yaw_pi,
             "enable_topdown_objective": True,
-            **_phase_gain_scales("MoveToPlaceAbove"),
+            **phase_scales,
         }
 
     if phase == "DescendToPlace":

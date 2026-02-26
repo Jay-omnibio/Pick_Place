@@ -263,6 +263,9 @@ class ActiveInferenceAgent:
             "escape_active",
             "obs_contact",
             "obs_grip",
+            "ctrl_grip_target_width",
+            "ctrl_grip_open_target_width",
+            "ctrl_grip_object_width_est",
             "true_ee_x",
             "true_ee_y",
             "true_ee_z",
@@ -291,6 +294,8 @@ class ActiveInferenceAgent:
             "ai_release_detach_counter",
             "ai_release_stable_counter",
             "ai_release_reapproach_count",
+            "ai_gripper_open_ready",
+            "ai_gripper_close_ready",
         ]
 
     @staticmethod
@@ -382,6 +387,40 @@ class ActiveInferenceAgent:
         except (TypeError, ValueError):
             pass
         return float(default)
+
+    @staticmethod
+    def _fmt_optional_float(value):
+        v = float(value)
+        return f"{v:.4f}" if np.isfinite(v) else "nan"
+
+    def _gripper_debug_snapshot(self):
+        out = {
+            "target_width": float("nan"),
+            "open_target_width": float("nan"),
+            "object_width_est": float("nan"),
+        }
+        controller = getattr(self.actuator_backend, "controller", None)
+        if controller is None:
+            return out
+
+        target_width = getattr(controller, "gripper_target_width", None)
+        if target_width is not None and np.isfinite(float(target_width)):
+            out["target_width"] = float(target_width)
+
+        object_width_est = getattr(controller, "gripper_object_width_estimate", None)
+        if object_width_est is not None and np.isfinite(float(object_width_est)):
+            out["object_width_est"] = float(object_width_est)
+
+        get_open_target = getattr(controller, "get_default_open_target_width", None)
+        if callable(get_open_target):
+            try:
+                open_target = float(get_open_target())
+                if np.isfinite(open_target):
+                    out["open_target_width"] = open_target
+            except Exception:
+                pass
+
+        return out
 
     def _update_runtime_timing(self):
         now = time.perf_counter()
@@ -562,16 +601,70 @@ class ActiveInferenceAgent:
         controller = getattr(self.actuator_backend, "controller", None)
         if controller is None:
             raise ValueError("Active-inference mode requires a controller instance.")
+        open_target = self._resolve_controller_open_target(controller)
 
         out.update(
             {
-                "grip_open_target": float(controller.gripper_open_width),
+                "grip_open_target": float(open_target),
+                "grip_open_hard_max": float(controller.gripper_open_width),
                 "grip_close_target": float(controller.gripper_close_width),
+                "grip_open_min_target": float(getattr(controller, "gripper_open_min_width", 0.0)),
+                "grip_open_size_based": bool(getattr(controller, "gripper_size_based_open", False)),
+                "grip_open_clearance": float(getattr(controller, "gripper_open_clearance", 0.0)),
+                "grip_open_unknown_full_open": bool(
+                    getattr(controller, "gripper_open_unknown_full_open", True)
+                ),
+                "grip_object_width_estimate": float(
+                    getattr(controller, "gripper_object_width_estimate", np.nan)
+                ),
                 "grip_ready_width_tol": float(controller.gripper_width_tol),
                 "grip_ready_speed_tol": float(controller.gripper_speed_tol),
             }
         )
         return out
+
+    @staticmethod
+    def _resolve_controller_open_target(controller) -> float:
+        """
+        Resolve the active open target used by controller open mode.
+        Falls back to configured max-open width if dynamic estimate is unavailable.
+        """
+        open_hard_max = float(getattr(controller, "gripper_open_width", 0.0))
+        close_target = float(getattr(controller, "gripper_close_width", 0.0))
+        open_target = open_hard_max
+        getter = getattr(controller, "get_default_open_target_width", None)
+        if callable(getter):
+            try:
+                candidate = float(getter())
+                if np.isfinite(candidate):
+                    open_target = candidate
+            except Exception:
+                open_target = open_hard_max
+        return float(np.clip(open_target, close_target, open_hard_max))
+
+    def _refresh_runtime_gripper_params(self) -> None:
+        """
+        Keep gripper-related AI thresholds synchronized with controller runtime targets.
+        This prevents phase gating from using stale/static open targets.
+        """
+        controller = getattr(self.actuator_backend, "controller", None)
+        if controller is None:
+            return
+        self.active_inference_params["grip_open_target"] = float(
+            self._resolve_controller_open_target(controller)
+        )
+        self.active_inference_params["grip_open_hard_max"] = float(
+            getattr(controller, "gripper_open_width", self.active_inference_params.get("grip_open_target", 0.0))
+        )
+        self.active_inference_params["grip_close_target"] = float(
+            getattr(controller, "gripper_close_width", self.active_inference_params.get("grip_close_target", 0.0))
+        )
+        self.active_inference_params["grip_open_min_target"] = float(
+            getattr(controller, "gripper_open_min_width", self.active_inference_params.get("grip_open_min_target", 0.0))
+        )
+        self.active_inference_params["grip_object_width_estimate"] = float(
+            getattr(controller, "gripper_object_width_estimate", np.nan)
+        )
 
     @staticmethod
     def _fmt_vec3(vec):
@@ -647,6 +740,21 @@ class ActiveInferenceAgent:
             f"desc_norm={float(p['descend_threshold']):.4f} "
             f"place(xy/z)=({float(p['place_xy_threshold']):.4f}/"
             f"{float(p['place_z_threshold']):.4f})"
+        )
+        lines.append(
+            "[Config-AI] belief_update "
+            f"rxinfer_enabled={int(bool(p.get('rxinfer_enabled', False)))} "
+            f"process_noise(obj)={float(p.get('rxinfer_process_noise_obj', 0.0)):.6f} "
+            f"obs_noise(obj)={float(p.get('rxinfer_obs_noise_obj', 0.0)):.6f}"
+        )
+        lines.append(
+            "[Config-Gripper] "
+            f"size_based_open={int(bool(p.get('grip_open_size_based', False)))} "
+            f"open_min={float(p.get('grip_open_min_target', 0.0)):.4f} "
+            f"open_target={float(p.get('grip_open_target', 0.0)):.4f} "
+            f"open_max={float(p.get('grip_open_hard_max', p.get('grip_open_target', 0.0))):.4f} "
+            f"clearance={float(p.get('grip_open_clearance', 0.0)):.4f} "
+            f"obj_width_est={float(p.get('grip_object_width_estimate', np.nan)):.4f}"
         )
         lines.append(
             "[Config-Frame] AI reach/descend errors are evaluated in world-frame "
@@ -760,6 +868,12 @@ class ActiveInferenceAgent:
             f" obs_age={self.obs_age_ms:.1f}ms stale={self.obs_stale_warn} "
             f"loop={self.loop_dt_ms:.1f}ms jit={self.loop_jitter_ms:.1f}ms "
             f"obs_dt={obs_dt_s:.4f}s"
+        )
+        grip_dbg = self._gripper_debug_snapshot()
+        msg += (
+            f" g_tgt={self._fmt_optional_float(grip_dbg['target_width'])} "
+            f"g_open={self._fmt_optional_float(grip_dbg['open_target_width'])} "
+            f"g_objw={self._fmt_optional_float(grip_dbg['object_width_est'])}"
         )
 
         if phase == "Reach" and self.current_belief is not None:
@@ -896,9 +1010,11 @@ class ActiveInferenceAgent:
             vfe = float(self.current_belief.get("vfe_total", 0.0))
             conf_ok = int(self.current_belief.get("phase_conf_ok", 1))
             vfe_ok = int(self.current_belief.get("phase_vfe_ok", 1))
+            belief_backend = str(self.current_belief.get("belief_update_backend", "python_ema"))
             msg += f" conf={conf:.2f}"
             msg += f" vfe={vfe:.3f}"
             msg += f" gate={conf_ok}:{vfe_ok}"
+            msg += f" belief={belief_backend}"
             msg += f" overrun={self.loop_overrun_count}"
             release_warn = int(self.current_belief.get("release_warning", 0))
             if phase == "Open" or release_warn == 1:
@@ -987,6 +1103,7 @@ class ActiveInferenceAgent:
         obj_vel_norm = self._safe_norm(obj_vel_obs[:3]) if obj_vel_obs.size >= 3 else 0.0
         tgt_vel_norm = self._safe_norm(tgt_vel_obs[:3]) if tgt_vel_obs.size >= 3 else 0.0
         m = self._collect_log_metrics(sim_state, observation)
+        grip_dbg = self._gripper_debug_snapshot()
 
         if self.current_belief is not None:
             phase_name = str(self.current_belief.get("phase", "Reach"))
@@ -1059,6 +1176,9 @@ class ActiveInferenceAgent:
             "escape_active": int(self.escape_active),
             "obs_contact": int(observation["o_contact"]),
             "obs_grip": float(observation["o_grip"]),
+            "ctrl_grip_target_width": float(grip_dbg["target_width"]),
+            "ctrl_grip_open_target_width": float(grip_dbg["open_target_width"]),
+            "ctrl_grip_object_width_est": float(grip_dbg["object_width_est"]),
             "true_ee_x": float(sim_state["ee_pos"][0]),
             "true_ee_y": float(sim_state["ee_pos"][1]),
             "true_ee_z": float(sim_state["ee_pos"][2]),
@@ -1106,6 +1226,8 @@ class ActiveInferenceAgent:
             row["ai_release_reapproach_count"] = int(
                 self.current_belief.get("release_reapproach_count", 0)
             )
+            row["ai_gripper_open_ready"] = int(self.current_belief.get("gripper_open_ready", 0))
+            row["ai_gripper_close_ready"] = int(self.current_belief.get("gripper_close_ready", 0))
         else:
             row["ai_belief_ee_x"] = ""
             row["ai_belief_ee_y"] = ""
@@ -1132,6 +1254,8 @@ class ActiveInferenceAgent:
             row["ai_release_detach_counter"] = ""
             row["ai_release_stable_counter"] = ""
             row["ai_release_reapproach_count"] = ""
+            row["ai_gripper_open_ready"] = ""
+            row["ai_gripper_close_ready"] = ""
         hand_quat = sim_state.get("hand_quat_wxyz")
         if hand_quat is not None:
             hr, hp, hy = self._quat_wxyz_to_rpy(hand_quat)
@@ -1223,6 +1347,7 @@ class ActiveInferenceAgent:
         self.ee_true_history.append(np.array(sim_state["ee_pos"], dtype=float))
         observation = self.sensor_backend.get_observation(sim_state)
         self._update_observation_freshness(sim_state, observation)
+        self._refresh_runtime_gripper_params()
         self.obs_history.append(observation)
 
         if self.step_count < self.ai_startup_settle_steps:

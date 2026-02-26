@@ -34,6 +34,10 @@ class EEController:
         "tool_axis",
         "gripper_open_width",
         "gripper_close_width",
+        "gripper_size_based_open",
+        "gripper_open_clearance",
+        "gripper_open_min_width",
+        "gripper_open_unknown_full_open",
         "gripper_rate",
         "gripper_width_tol",
         "gripper_speed_tol",
@@ -84,6 +88,10 @@ class EEController:
         # Gripper dynamics
         self.gripper_open_width = float(config["gripper_open_width"])
         self.gripper_close_width = float(config["gripper_close_width"])
+        self.gripper_size_based_open = bool(config["gripper_size_based_open"])
+        self.gripper_open_clearance = max(0.0, float(config["gripper_open_clearance"]))
+        self.gripper_open_min_width = float(config["gripper_open_min_width"])
+        self.gripper_open_unknown_full_open = bool(config["gripper_open_unknown_full_open"])
         self.gripper_rate = float(config["gripper_rate"])
         self.gripper_target_width = None 
         self.gripper_mode = "open"
@@ -99,6 +107,12 @@ class EEController:
         self.last_dq_norm_raw = 0.0
         self.last_dq_norm_applied = 0.0
         self.prev_move_delta = np.zeros(3, dtype=float)
+        self.gripper_object_width_estimate = None
+
+        self.gripper_open_min_width = float(
+            np.clip(self.gripper_open_min_width, self.gripper_close_width, self.gripper_open_width)
+        )
+        self.gripper_object_width_estimate = self._estimate_object_grasp_width()
 
         self.yaw_target = self._interpret_yaw_target(self.yaw_target)
 
@@ -326,28 +340,43 @@ class EEController:
                 J = np.vstack([J, yaw_w * J_yaw])
                 err = np.concatenate([err, np.array([yaw_w * yaw_err])])
 
-        JT = J.T
-        task_dim = J.shape[0]
-        A = J @ JT + (self.ik_damping ** 2) * np.eye(task_dim)
+        q = data.qpos[self.arm_qpos_addr].copy()
+        null_gain = self.nullspace_gain_grasp if grip_cmd == 1 else self.nullspace_gain
+        null_gain = float(null_gain) * float(getattr(self, "_step_nullspace_gain_scale", 1.0))
+        q_err = self.q_pref - q
 
-        try:
-            # Damped least-squares pseudoinverse via linear solve
-            A_inv_err = np.linalg.solve(A, err)
-            dq_task = JT @ A_inv_err
+        def _solve_dq(J_use, err_use):
+            JT = J_use.T
+            task_dim = J_use.shape[0]
+            A = J_use @ JT + (self.ik_damping ** 2) * np.eye(task_dim)
+            try:
+                # Damped least-squares pseudoinverse via linear solve
+                A_inv_err = np.linalg.solve(A, err_use)
+                dq_task = JT @ A_inv_err
 
-            A_inv_I = np.linalg.solve(A, np.eye(task_dim))
-            J_pinv = JT @ A_inv_I
-        except np.linalg.LinAlgError:
+                A_inv_I = np.linalg.solve(A, np.eye(task_dim))
+                J_pinv = JT @ A_inv_I
+            except np.linalg.LinAlgError:
+                return None
+            dq_null = null_gain * q_err
+            N = np.eye(len(q)) - (J_pinv @ J_use)
+            return dq_task + N @ dq_null
+
+        dq = _solve_dq(J, err)
+        if dq is None:
             # Rare numerical issue: fallback to mocap path
             self.simulator.set_ee_position(target_pos)
             return
 
-        q = data.qpos[self.arm_qpos_addr].copy()
-        null_gain = self.nullspace_gain_grasp if grip_cmd == 1 else self.nullspace_gain
-        null_gain = float(null_gain) * float(getattr(self, "_step_nullspace_gain_scale", 1.0))
-        dq_null = null_gain * (self.q_pref - q)
-        N = np.eye(len(q)) - (J_pinv @ J)
-        dq = dq_task + N @ dq_null
+        # Safety guard: if full objective predicts XY motion away from target,
+        # solve this step with translation-only objective.
+        xy_demand = float(np.linalg.norm(err_pos[:2]))
+        if xy_demand > 0.004:
+            pred_delta = J_pos @ dq
+            if float(np.dot(pred_delta[:2], err_pos[:2])) < -1e-6:
+                dq_pos = _solve_dq(J_pos, err_pos)
+                if dq_pos is not None:
+                    dq = dq_pos
 
         dq_norm = np.linalg.norm(dq)
         self.last_dq_norm_raw = float(dq_norm)
@@ -403,14 +432,14 @@ class EEController:
                 close_target = self.gripper_close_width
             close_target = float(np.clip(close_target, self.gripper_close_width, self.gripper_open_width))
 
-        open_target = self.gripper_open_width
+        open_target = self._default_open_target_width()
         if open_target_override is not None:
             try:
                 open_target = float(open_target_override)
             except (TypeError, ValueError):
-                open_target = self.gripper_open_width
+                open_target = self._default_open_target_width()
             if not np.isfinite(open_target):
-                open_target = self.gripper_open_width
+                open_target = self._default_open_target_width()
             open_target = float(np.clip(open_target, self.gripper_close_width, self.gripper_open_width))
 
         self.gripper_target_width = close_target if self.gripper_mode == "close" else open_target
@@ -421,6 +450,42 @@ class EEController:
         else:
             next_width = current_width + np.sign(diff) * self.gripper_rate
         self.simulator.set_gripper_width(next_width)
+
+    def _estimate_object_grasp_width(self):
+        getter = getattr(self.simulator, "get_object_grasp_width_estimate", None)
+        if not callable(getter):
+            return None
+        try:
+            width = float(getter())
+        except Exception:
+            return None
+        if not np.isfinite(width) or width <= 0.0:
+            return None
+        return float(width)
+
+    def get_default_open_target_width(self):
+        return float(self._default_open_target_width())
+
+    def _default_open_target_width(self):
+        # Legacy behavior: always open to configured max width.
+        if not self.gripper_size_based_open:
+            return float(self.gripper_open_width)
+
+        # Refresh object width estimate continuously so open target adapts if
+        # object changes (shape/pose) between episodes or retries.
+        latest_width = self._estimate_object_grasp_width()
+        if latest_width is not None:
+            self.gripper_object_width_estimate = latest_width
+
+        obj_width = self.gripper_object_width_estimate
+
+        if obj_width is None:
+            if self.gripper_open_unknown_full_open:
+                return float(self.gripper_open_width)
+            return float(self.gripper_open_min_width)
+
+        target = float(obj_width + self.gripper_open_clearance)
+        return float(np.clip(target, self.gripper_open_min_width, self.gripper_open_width))
 
     def _get_ee_yaw(self):
         xmat = self._get_ee_xmat()
