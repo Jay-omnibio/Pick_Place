@@ -1,5 +1,7 @@
 # Active-Inference + BT Architecture
 
+Last updated: 2026-03-04
+
 ## Goal
 Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the low-level action policy for pick-and-place.
 
@@ -21,19 +23,21 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
 ### Active-Inference Phase Pipeline
 1. `Reach`
 2. `Align`
-3. `PreGraspHold`
-4. `Descend`
-5. `CloseHold`
-6. `LiftTest`
-7. `Transit`
-8. `MoveToPlaceAbove`
-9. `DescendToPlace`
-10. `Open`
-11. `Retreat`
-12. `Done`
+3. `Descend`
+4. `CloseHold`
+5. `LiftTest`
+6. `Transit`
+7. `MoveToPlaceAbove`
+8. `DescendToPlace`
+9. `Open`
+10. `Retreat`
+11. `Done`
 
 ### Transition Quality Gates
 - Reach/descend gates use configured thresholds and timers.
+- Align includes merged settle gating before descend:
+  - requires consecutive stable-ready steps (`align_settle_steps`).
+  - uses small near-threshold corrective move cap (`align_settle_step`).
 - Place-open gate is strict axis-based plus optional yaw and confidence/VFE gate:
   - `place_xy_ok AND place_z_ok AND place_yaw_ok AND phase_gate_ok`
 - Open-ready checks are gripper-target aware (runtime sync with controller dynamic open target).

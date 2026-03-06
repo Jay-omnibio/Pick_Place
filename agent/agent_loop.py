@@ -33,7 +33,7 @@ class ActiveInferenceAgent:
     def _build_task_cfg_fallback(active_cfg):
         cfg = dict(active_cfg or {})
         return SimpleNamespace(
-            pregrasp_obj_rel=np.asarray(cfg.get("reach_obj_rel", [0.0, 0.0, -0.08]), dtype=float),
+            reach_obj_rel=np.asarray(cfg.get("reach_obj_rel", [0.0, 0.0, -0.08]), dtype=float),
             grasp_obj_rel=np.asarray(cfg.get("descend_obj_rel", [0.0, 0.0, 0.0]), dtype=float),
             preplace_target_rel=np.asarray(cfg.get("preplace_target_rel", [0.0, 0.0, -0.06]), dtype=float),
             place_target_rel=np.asarray(cfg.get("place_target_rel", [0.0, 0.0, -0.01]), dtype=float),
@@ -162,8 +162,12 @@ class ActiveInferenceAgent:
         self.prev_ai_release_warning = 0
         self.prev_ai_singularity_warn = 0
         self.prev_ai_unintended_contact_warn = 0
+        self.prev_ctrl_xy_wrong_way = 0
+        self.prev_ctrl_xy_guard_applied = 0
         self.log_contact_events = self._env_flag("LOG_CONTACT_EVENTS", False)
         self.log_pose_debug = self._env_flag("LOG_POSE_DEBUG", False)
+        self.console_story_mode = self._env_flag("CONSOLE_STORY_MODE", True)
+        self.log_reach_heartbeat = self._env_flag("LOG_REACH_HEARTBEAT", False)
         self.pause_on_reach_to_descend = self._env_flag("PAUSE_ON_REACH_TO_DESCEND", True)
         self.pause_on_reach_to_descend_once = self._env_flag("PAUSE_ON_REACH_TO_DESCEND_ONCE", True)
         self.pause_on_phase_change = self._env_flag("PAUSE_ON_PHASE_CHANGE", True)
@@ -175,6 +179,7 @@ class ActiveInferenceAgent:
         self.last_transition_reason = ""
         self.prev_action_grip = None
         self._hb_prev_metrics = None
+        self._phase_story = None
 
         self.obs_history = deque(maxlen=50)
         self.action_history = deque(maxlen=50)
@@ -218,7 +223,6 @@ class ActiveInferenceAgent:
             "est_target_vel_norm",
             "distance_to_object",
             "reach_error",
-            "pregrasp_error",
             "descend_error",
             "descend_x_error",
             "descend_y_error",
@@ -266,6 +270,10 @@ class ActiveInferenceAgent:
             "ctrl_grip_target_width",
             "ctrl_grip_open_target_width",
             "ctrl_grip_object_width_est",
+            "ctrl_xy_align_cos",
+            "ctrl_xy_wrong_way",
+            "ctrl_xy_guard_applied",
+            "ctrl_xy_wrong_way_rate",
             "true_ee_x",
             "true_ee_y",
             "true_ee_z",
@@ -422,6 +430,96 @@ class ActiveInferenceAgent:
 
         return out
 
+    def _controller_consistency_snapshot(self):
+        out = {
+            "xy_align_cos": float("nan"),
+            "xy_wrong_way": 0,
+            "xy_guard_applied": 0,
+            "xy_wrong_way_rate": float("nan"),
+            "xy_eval_count": 0,
+            "xy_wrong_way_count": 0,
+        }
+        controller = getattr(self.actuator_backend, "controller", None)
+        if controller is None:
+            return out
+        getter = getattr(controller, "get_consistency_snapshot", None)
+        if not callable(getter):
+            return out
+        try:
+            snap = dict(getter())
+        except Exception:
+            return out
+        for key in out.keys():
+            if key in snap:
+                out[key] = snap[key]
+        out["xy_align_cos"] = float(out["xy_align_cos"])
+        out["xy_wrong_way_rate"] = float(out["xy_wrong_way_rate"])
+        out["xy_wrong_way"] = int(out["xy_wrong_way"])
+        out["xy_guard_applied"] = int(out["xy_guard_applied"])
+        out["xy_eval_count"] = int(out["xy_eval_count"])
+        out["xy_wrong_way_count"] = int(out["xy_wrong_way_count"])
+        return out
+
+    def _phase_story_start(self, phase: str, metrics: dict):
+        ctrl = self._controller_consistency_snapshot()
+        self._phase_story = {
+            "phase": str(phase),
+            "start_step": int(self.step_count),
+            "min_reach_xy": float(metrics.get("true_reach_xy_error", float("inf"))),
+            "min_reach_z": float(metrics.get("true_reach_z_error", float("inf"))),
+            "min_descend_xy": float(metrics.get("true_descend_xy_error", float("inf"))),
+            "min_descend_z": float(metrics.get("true_descend_z_error", float("inf"))),
+            "min_preplace": float(metrics.get("obs_preplace_error", float("inf"))),
+            "min_place": float(metrics.get("obs_place_error", float("inf"))),
+            "ctrl_wrong_start": int(ctrl.get("xy_wrong_way_count", 0)),
+            "ctrl_guard_hits": 0,
+        }
+
+    def _phase_story_update(self, phase: str, metrics: dict, ctrl: dict):
+        if self._phase_story is None or str(self._phase_story.get("phase", "")) != str(phase):
+            self._phase_story_start(phase, metrics)
+            return
+        s = self._phase_story
+        s["min_reach_xy"] = float(min(s["min_reach_xy"], metrics.get("true_reach_xy_error", float("inf"))))
+        s["min_reach_z"] = float(min(s["min_reach_z"], metrics.get("true_reach_z_error", float("inf"))))
+        s["min_descend_xy"] = float(min(s["min_descend_xy"], metrics.get("true_descend_xy_error", float("inf"))))
+        s["min_descend_z"] = float(min(s["min_descend_z"], metrics.get("true_descend_z_error", float("inf"))))
+        s["min_preplace"] = float(min(s["min_preplace"], metrics.get("obs_preplace_error", float("inf"))))
+        s["min_place"] = float(min(s["min_place"], metrics.get("obs_place_error", float("inf"))))
+        if int(ctrl.get("xy_guard_applied", 0)) == 1:
+            s["ctrl_guard_hits"] = int(s.get("ctrl_guard_hits", 0)) + 1
+
+    def _log_phase_end_summary(self, next_phase: str):
+        if self._phase_story is None:
+            return
+        s = self._phase_story
+        phase = str(s.get("phase", "?"))
+        steps = max(1, int(self.step_count - int(s.get("start_step", self.step_count))))
+        ctrl = self._controller_consistency_snapshot()
+        ctrl_wrong_end = int(ctrl.get("xy_wrong_way_count", 0))
+        ctrl_wrong_hits = max(0, ctrl_wrong_end - int(s.get("ctrl_wrong_start", 0)))
+        msg = f"[PhaseEnd] {phase} steps={steps}"
+        if phase == "Reach":
+            msg += (
+                f" best_xy={float(s.get('min_reach_xy', float('nan'))):.4f}"
+                f" best_z={float(s.get('min_reach_z', float('nan'))):.4f}"
+            )
+        elif phase == "Descend":
+            msg += (
+                f" best_xy={float(s.get('min_descend_xy', float('nan'))):.4f}"
+                f" best_z={float(s.get('min_descend_z', float('nan'))):.4f}"
+            )
+        elif phase == "MoveToPlaceAbove":
+            msg += f" best_norm={float(s.get('min_preplace', float('nan'))):.4f}"
+        elif phase == "DescendToPlace":
+            msg += f" best_norm={float(s.get('min_place', float('nan'))):.4f}"
+        msg += (
+            f" ctrl_wrong_hits={ctrl_wrong_hits}"
+            f" ctrl_guard_hits={int(s.get('ctrl_guard_hits', 0))}"
+            f" -> {next_phase}"
+        )
+        print(msg)
+
     def _update_runtime_timing(self):
         now = time.perf_counter()
         if self._last_step_wall_time is None:
@@ -476,7 +574,7 @@ class ActiveInferenceAgent:
 
         if phase == "Reach":
             return self._safe_norm(s_obj - np.asarray(b.get("reach_obj_rel", [0.0, 0.0, 0.0]), dtype=float))
-        if phase in ("Align", "PreGraspHold"):
+        if phase == "Align":
             return self._safe_norm(s_obj - np.asarray(b.get("align_obj_rel", [0.0, 0.0, 0.0]), dtype=float))
         if phase in ("Descend", "CloseHold", "LiftTest"):
             return self._safe_norm(s_obj - np.asarray(b.get("descend_obj_rel", [0.0, 0.0, 0.0]), dtype=float))
@@ -875,6 +973,12 @@ class ActiveInferenceAgent:
             f"g_open={self._fmt_optional_float(grip_dbg['open_target_width'])} "
             f"g_objw={self._fmt_optional_float(grip_dbg['object_width_est'])}"
         )
+        ctrl_dbg = self._controller_consistency_snapshot()
+        msg += (
+            f" cxy={self._fmt_optional_float(ctrl_dbg['xy_align_cos'])} "
+            f"cww={int(ctrl_dbg['xy_wrong_way'])} "
+            f"cgd={int(ctrl_dbg['xy_guard_applied'])}"
+        )
 
         if phase == "Reach" and self.current_belief is not None:
             turn_sign = int(self.current_belief.get("reach_turn_sign", 0))
@@ -1084,8 +1188,8 @@ class ActiveInferenceAgent:
         # Keep logged reach/descend errors in the same frame as controller math.
         obj_rel_eval = obj_rel.copy()
         target_rel = np.asarray(observation["o_target"], dtype=float)
-        pregrasp_ref, descend_ref = self._get_references()
-        pregrasp_error = float(np.linalg.norm(obj_rel_eval - pregrasp_ref))
+        reach_ref, descend_ref = self._get_references()
+        reach_error = float(np.linalg.norm(obj_rel_eval - reach_ref))
         descend_error = float(np.linalg.norm(obj_rel_eval - descend_ref))
         descend_x_error = float(abs((obj_rel_eval - descend_ref)[0]))
         descend_y_error = float(abs((obj_rel_eval - descend_ref)[1]))
@@ -1104,12 +1208,12 @@ class ActiveInferenceAgent:
         tgt_vel_norm = self._safe_norm(tgt_vel_obs[:3]) if tgt_vel_obs.size >= 3 else 0.0
         m = self._collect_log_metrics(sim_state, observation)
         grip_dbg = self._gripper_debug_snapshot()
+        ctrl_dbg = self._controller_consistency_snapshot()
 
         if self.current_belief is not None:
             phase_name = str(self.current_belief.get("phase", "Reach"))
             phase_timer_key = {
                 "Align": "align_timer",
-                "PreGraspHold": "pregrasp_hold_timer",
                 "Descend": "descend_timer",
                 "CloseHold": "close_hold_timer",
                 "LiftTest": "lift_test_timer",
@@ -1140,8 +1244,7 @@ class ActiveInferenceAgent:
             "est_obj_vel_norm": float(obj_vel_norm),
             "est_target_vel_norm": float(tgt_vel_norm),
             "distance_to_object": float(np.linalg.norm(obj_rel)),
-            "reach_error": pregrasp_error,
-            "pregrasp_error": pregrasp_error,
+            "reach_error": reach_error,
             "descend_error": descend_error,
             "descend_x_error": descend_x_error,
             "descend_y_error": descend_y_error,
@@ -1152,9 +1255,9 @@ class ActiveInferenceAgent:
             "obs_descend_xy_error": float(m["obs_descend_xy_error"]),
             "obs_preplace_error": float(m["obs_preplace_error"]),
             "obs_place_error": float(m["obs_place_error"]),
-            "active_reach_ref_x": float(pregrasp_ref[0]),
-            "active_reach_ref_y": float(pregrasp_ref[1]),
-            "active_reach_ref_z": float(pregrasp_ref[2]),
+            "active_reach_ref_x": float(reach_ref[0]),
+            "active_reach_ref_y": float(reach_ref[1]),
+            "active_reach_ref_z": float(reach_ref[2]),
             "active_descend_ref_x": float(descend_ref[0]),
             "active_descend_ref_y": float(descend_ref[1]),
             "active_descend_ref_z": float(descend_ref[2]),
@@ -1179,6 +1282,10 @@ class ActiveInferenceAgent:
             "ctrl_grip_target_width": float(grip_dbg["target_width"]),
             "ctrl_grip_open_target_width": float(grip_dbg["open_target_width"]),
             "ctrl_grip_object_width_est": float(grip_dbg["object_width_est"]),
+            "ctrl_xy_align_cos": float(ctrl_dbg["xy_align_cos"]),
+            "ctrl_xy_wrong_way": int(ctrl_dbg["xy_wrong_way"]),
+            "ctrl_xy_guard_applied": int(ctrl_dbg["xy_guard_applied"]),
+            "ctrl_xy_wrong_way_rate": float(ctrl_dbg["xy_wrong_way_rate"]),
             "true_ee_x": float(sim_state["ee_pos"][0]),
             "true_ee_y": float(sim_state["ee_pos"][1]),
             "true_ee_z": float(sim_state["ee_pos"][2]),
@@ -1400,7 +1507,14 @@ class ActiveInferenceAgent:
         self._maybe_pause_for_inspection(sim_state, observation)
 
         if self.step_count % self.log_every_steps == 0:
-            self._log_heartbeat(sim_state, observation, action)
+            phase_now = self._phase_name()
+            skip_reach_hb = (
+                self.console_story_mode
+                and (not self.log_reach_heartbeat)
+                and phase_now == "Reach"
+            )
+            if not skip_reach_hb:
+                self._log_heartbeat(sim_state, observation, action)
 
         self.actuator_backend.apply_action(action)
         self.step_count += 1
@@ -1471,12 +1585,15 @@ class ActiveInferenceAgent:
         phase = self._phase_name()
         contact = int(observation.get("o_contact", 0))
         m = self._collect_log_metrics(sim_state, observation)
+        ctrl_dbg = self._controller_consistency_snapshot()
 
         if self.prev_phase is None:
             self.prev_phase = phase
             self.prev_contact = contact
             self.prev_escape_active = self.escape_active
             self.prev_action_grip = int(action.get("grip", 0))
+            self.prev_ctrl_xy_wrong_way = int(ctrl_dbg.get("xy_wrong_way", 0))
+            self.prev_ctrl_xy_guard_applied = int(ctrl_dbg.get("xy_guard_applied", 0))
             if self.current_belief is not None:
                 self.prev_ai_release_warning = int(self.current_belief.get("release_warning", 0))
             else:
@@ -1493,9 +1610,11 @@ class ActiveInferenceAgent:
                 f"pause_on_phase_change={int(self.pause_on_phase_change)} "
                 f"pause_on_grip_start={int(self.pause_on_grip_start)}"
             )
+            self._phase_story_start(phase, m)
             return
 
         if phase != self.prev_phase:
+            self._log_phase_end_summary(phase)
             msg = (
                 f"[Phase] step={self.step_count} {self.prev_phase}->{phase} contact={contact} "
                 f"reach=({m['true_reach_x_error']:.4f},{m['true_reach_y_error']:.4f},{m['true_reach_z_error']:.4f}) "
@@ -1516,6 +1635,9 @@ class ActiveInferenceAgent:
             print(msg)
             if self.pause_on_phase_change:
                 self._queue_pause(f"{self.prev_phase}->{phase}")
+            self._phase_story_start(phase, m)
+        else:
+            self._phase_story_update(phase, m, ctrl_dbg)
 
         grip_cmd = int(action.get("grip", 0))
         if (
@@ -1547,6 +1669,21 @@ class ActiveInferenceAgent:
             print(
                 f"[Recovery] step={self.step_count} state={label} "
                 f"action_move={action.get('move', action.get('ee_target_pos', []))} ee={sim_state['ee_pos'].tolist()}"
+            )
+
+        ctrl_xy_wrong_way = int(ctrl_dbg.get("xy_wrong_way", 0))
+        ctrl_xy_guard = int(ctrl_dbg.get("xy_guard_applied", 0))
+        if ctrl_xy_guard == 1 and self.prev_ctrl_xy_guard_applied == 0:
+            print(
+                f"[CtrlGuard] step={self.step_count} phase={phase} "
+                f"xy_align={self._fmt_optional_float(ctrl_dbg.get('xy_align_cos', float('nan')))}"
+            )
+        if ctrl_xy_wrong_way == 1 and self.prev_ctrl_xy_wrong_way == 0:
+            print(
+                f"[CtrlWarn] step={self.step_count} phase={phase} "
+                f"type=xy_wrong_way "
+                f"xy_align={self._fmt_optional_float(ctrl_dbg.get('xy_align_cos', float('nan')))} "
+                f"wrong_rate={self._fmt_optional_float(ctrl_dbg.get('xy_wrong_way_rate', float('nan')))}"
             )
 
         if self.current_belief is not None:
@@ -1586,3 +1723,5 @@ class ActiveInferenceAgent:
         self.prev_contact = contact
         self.prev_escape_active = self.escape_active
         self.prev_action_grip = grip_cmd
+        self.prev_ctrl_xy_wrong_way = ctrl_xy_wrong_way
+        self.prev_ctrl_xy_guard_applied = ctrl_xy_guard

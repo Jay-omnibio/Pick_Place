@@ -35,6 +35,11 @@ OBJ_WORLD_XYZ="0.60,0.00,0.20" OBJ_WORLD_QUAT_WXYZ="1,0,0,0" python3 run_pick_pl
 COMMON_CONFIG_PATH=config/common_robot.yaml ACTIVE_INFERENCE_CONFIG_PATH=config/active_inference_config.yaml python3 run_pick_place.py --no-render --no-pause
 ```
 
+### Meeting demo run (clean, deterministic-style)
+```bash
+OBJ_WORLD_XYZ="0.50,0.00,0.20" OBJ_WORLD_QUAT_WXYZ="1,0,0,0" python3 run_pick_place.py --no-render --no-pause
+```
+
 ## 2) Single-Run Diagnostics
 
 ### Analyze latest run CSV
@@ -128,8 +133,14 @@ python3 tools/extract_mermaid_from_md.py --root . --out docs/mermaid
 ## 7) Quick Push-Readiness Checks
 
 ### Syntax check all Python files
+Linux/macOS:
 ```bash
 python3 -m py_compile $(find . -name "*.py")
+```
+
+PowerShell:
+```powershell
+Get-ChildItem -Recurse -Filter *.py | ForEach-Object { python3 -m py_compile $_.FullName }
 ```
 
 ### Show git status

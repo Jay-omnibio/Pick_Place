@@ -101,7 +101,7 @@ class SetPlacePriorsNode(BTNode):
 
 
 class AIPickPlaceBehaviorTree:
-    PICK_PHASES = ("Reach", "Align", "PreGraspHold", "Descend", "CloseHold", "LiftTest")
+    PICK_PHASES = ("Reach", "Align", "Descend", "CloseHold", "LiftTest")
     PLACE_PHASES = ("Transit", "MoveToPlaceAbove", "DescendToPlace", "Open", "Retreat")
     TERMINAL_SUCCESS_PHASES = ("Done",)
     TERMINAL_FAILURE_PHASES = ("Failure",)
@@ -354,7 +354,7 @@ class AIPickPlaceBehaviorTree:
         if phase == "Reach":
             ref = np.asarray(belief.get("reach_obj_rel", [0.0, 0.0, 0.0]), dtype=float)
             return self._safe_norm(s_obj - ref)
-        if phase in ("Align", "PreGraspHold"):
+        if phase == "Align":
             ref = np.asarray(belief.get("align_obj_rel", [0.0, 0.0, 0.0]), dtype=float)
             return self._safe_norm(s_obj - ref)
         if phase in ("Descend", "CloseHold", "LiftTest"):
@@ -394,7 +394,7 @@ class AIPickPlaceBehaviorTree:
 
     @staticmethod
     def _stall_reason(phase: str) -> str:
-        if phase in ("Reach", "Align", "PreGraspHold", "Descend"):
+        if phase in ("Reach", "Align", "Descend"):
             return "reach_stall"
         if phase in ("CloseHold", "LiftTest"):
             return "grasp_failed"
@@ -573,7 +573,7 @@ class AIPickPlaceBehaviorTree:
         next_belief["reach_yaw_align_timer"] = 0
         next_belief["reach_yaw_align_done"] = 0
         next_belief["align_timer"] = 0
-        next_belief["pregrasp_hold_timer"] = 0
+        next_belief["align_settle_counter"] = 0
         next_belief["descend_timer"] = 0
         next_belief["descend_best_error"] = float("inf")
         next_belief["descend_no_progress_steps"] = 0

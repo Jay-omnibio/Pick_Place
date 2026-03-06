@@ -3,20 +3,19 @@ inference:
   # Format: [x, y, z] in object-local XY (meters), with z in world vertical relation.
   # Runtime converts these to world-frame relation using object yaw each step.
   # Reach/Align auto-pick +/- approach side along local X based on object side to base.
-  reach_obj_rel: [0.00, 0.00, -0.08]        # Reach target above object.
+  reach_obj_rel: [0.00, 0.00, -0.06]        # Reach target above object.
   align_obj_rel: [0.00, 0.00, -0.06]        # Align target before descend.
   descend_obj_rel: [0.00, 0.0, 0.02]        # Descend/grasp target near object top.
 
   # ---------- Phase gates ----------
-  approach_threshold: 0.05                  # Reach -> Align when reach error < this.
-  align_threshold: 0.025                    # Align considered good when error < this.
+  approach_threshold: 0.04                  # Reach -> Align when reach error < this.
+  align_threshold: 0.05                    # Align considered good when error < this.
   descend_threshold: 0.025                  # Descend norm threshold (plus axis checks).
 
   # ---------- Phase timers ----------
   align_max_steps: 300                      # Max steps allowed in Align.
   align_min_steps: 3                        # Fast profile: shorter minimum align dwell.
-  pregrasp_hold_steps: 30                   # Fast profile: shorter hold before Descend.
-  pregrasp_hold_ready_grace_steps: 10       # Fast profile: shorter extra wait.
+  align_settle_steps: 4                     # Consecutive settle-ready steps before Align -> Descend.
   descend_max_steps: 1000                   # Base Descend timeout budget.
 
   # ---------- Descend strict axis thresholds ----------
@@ -47,7 +46,7 @@ inference:
 
   # ---------- Belief smoothing / reacquire ----------
   alpha_ee: 0.7                             # EE observation smoothing gain.
-  alpha_obj_default: 0.4  # 0.7 changed                   # Object smoothing gain (non-Reach phases).
+  alpha_obj_default: 0.4  # 0.7 changed     # Object smoothing gain (non-Reach phases).
   alpha_obj_reach: 0.9                      # Object smoothing gain (Reach phase).
   alpha_target: 0.8                         # Target smoothing gain.
   obj_reacquire_jump: 0.05                  # If object jump > this, trust current obs more.
@@ -132,13 +131,13 @@ inference:
   preplace_xy_threshold: 0.02               # XY threshold for MoveToPlaceAbove.
   preplace_z_threshold: 0.03                # Z threshold for MoveToPlaceAbove.
   preplace_max_steps: 1200                  # Max steps in MoveToPlaceAbove before timeout handling.
-  preplace_progress_eps: 0.0008             # Improvement epsilon for MoveToPlaceAbove progress watchdog.
-  preplace_stall_steps: 220                 # No-progress steps considered stalled in MoveToPlaceAbove.
+  preplace_progress_eps: 0.0003             # Improvement epsilon for MoveToPlaceAbove progress watchdog.
+  preplace_stall_steps: 160                 # No-progress steps considered stalled in MoveToPlaceAbove.
   preplace_timeout_extension_steps: 120     # Extra steps granted when still improving near timeout.
   preplace_max_timeout_extensions: 2        # Max timeout extensions in MoveToPlaceAbove.
   preplace_timeout_xy_threshold: 0.05       # Timeout-near XY bound to allow MoveToPlaceAbove -> DescendToPlace.
   preplace_timeout_z_threshold: 0.06        # Timeout-near Z bound to allow MoveToPlaceAbove -> DescendToPlace.
-  place_xy_threshold: 0.020                 # XY threshold for DescendToPlace.
+  place_xy_threshold: 0.015   #changed 0.020 # XY threshold for DescendToPlace.
   place_z_threshold: 0.015                  # Z threshold for DescendToPlace.
   place_descend_max_steps: 500              # Max steps for DescendToPlace before re-approach/failure handling.
   place_descend_progress_eps: 0.0008        # Improvement epsilon used by place descend stall watchdog.
@@ -155,15 +154,15 @@ inference:
 action_selection:
   # ---------- Expected Free Energy / prediction ----------
   lambda_epistemic: 0.35  # 0.1 changed                   # Epistemic weight in EFE.
-  delta: 0.030                              # Fast profile: larger fallback move step.
-  reach_delta: 0.042                        # Fast profile: larger Reach cartesian step.
+  delta: 0.040                #0.030              # Fast profile: larger fallback move step.
+  reach_delta: 0.060          #0.042               # Fast profile: larger Reach cartesian step.
   action_effectiveness: 0.3   #changed 0.4              # Belief dynamics coupling factor.
 
   # ---------- Reach XY/Z blending ----------
   reach_axis_threshold_x: 0.015             # X normalization for Reach axis-priority.
   reach_axis_threshold_y: 0.015             # Y normalization for Reach axis-priority.
   reach_z_blend_start: 0.06                 # Start adding Z when XY max error drops below this.
-  reach_z_blend_full: 0.005  #0.02 changed               # Full Z when XY max error drops below this.
+  reach_z_blend_full: 0.005  #0.02 changed  # Full Z when XY max error drops below this.
   reach_step_min: 0.014                     # Fast profile: higher Reach step floor.
 
   # ---------- Reach arc/spiral ----------
@@ -176,7 +175,7 @@ action_selection:
   # ---------- Phase-local step caps ----------
   grasp_step: 0.018                         # Fast profile: larger Descend/grasp step.
   align_step: 0.020                         # Fast profile: larger Align step.
-  pregrasp_hold_step: 0.012                 # Fast profile: larger PreGraspHold correction.
+  align_settle_step: 0.012                  # Max tiny corrective step during merged Align settle window.
   confidence_speed_scaling_enabled: true    # Scale Reach/Descend step size by observation confidence.
   confidence_speed_min_scale: 0.65          # Fast profile: less slowdown at low confidence.
   reach_confidence_speed_power: 1.0         # Reach scale uses confidence^power.

@@ -1,6 +1,6 @@
 # AI+BT Partwise Findings (Deep Review)
 
-Last updated: 2026-02-26
+Last updated: 2026-03-04
 
 Purpose:
 1. Keep one deep, code-grounded status review of the AI+BT runtime.
@@ -8,8 +8,12 @@ Purpose:
 3. Use one shared language (`P0`, `P1`, `P2`) for future fixes.
 
 Evidence baseline used for this revision:
-1. Latest successful opposite-side run: `logs/run_20260226_163346.csv`.
-2. Matching diagnostics: `logs/reports/run_20260226_163346_diagnostics.md`.
+1. Latest multi-scenario sweep: `logs/reports/position_sweep_20260301_134501.md`.
+2. Recent failed-run diagnostics for bottleneck analysis:
+ - `logs/reports/run_20260301_135118_diagnostics.md`
+ - `logs/reports/run_20260301_140218_diagnostics.md`
+ - `logs/reports/run_20260301_140453_diagnostics.md`
+ - `logs/reports/run_20260301_140952_diagnostics.md`
 3. Current runtime code in `agent/`, `inference/`, `control/`, `env/`, `config/`.
 
 ---
@@ -198,5 +202,5 @@ Completion estimate:
 
 ## Snapshot Conclusion
 1. RxInfer integration is a major step forward and has improved difficult reach cases.
-2. End-to-end `Done` is now reliable in scenarios that previously failed.
-3. The main remaining bottleneck is efficiency and stability in post-lift place approach, not basic feasibility.
+2. End-to-end `Done` is stable in easier workspace slices but still variable in hard geometry/noise slices.
+3. Current dominant bottleneck in latest sweep is pick-side progression robustness (`Reach/Align/Descend`) rather than place-side completion once post-lift phases are reached.

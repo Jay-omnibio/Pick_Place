@@ -15,7 +15,7 @@ controller:
   min_height: 0.02
   max_target_radius: 0.78 
   ik_damping: 0.03
-  nullspace_gain: 0.10 #0.15 changed
+  nullspace_gain: 0.15 #0.15 changed # mean joint position error tolerance for success
   nullspace_gain_grasp: 0.05
   max_joint_step: 0.30
   ee_tolerance: 0.0001 # mean position error tolerance for success

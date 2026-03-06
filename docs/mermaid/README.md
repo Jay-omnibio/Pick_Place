@@ -1,6 +1,7 @@
 # Mermaid Extracts
 
 Generated from Markdown Mermaid blocks.
+Last refreshed: 2026-03-04
 
 - Source root: repository `docs/` Markdown files
 - Total `.mmd` files: `3`

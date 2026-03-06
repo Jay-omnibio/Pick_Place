@@ -132,7 +132,7 @@ def _phase_metric_specs(phase_name: str):
             ("obs_reach_xy_error", "reach_xy_err"),
             ("obs_reach_z_error", "reach_z_err"),
         ]
-    if p in {"Align", "PreGraspHold", "Descend", "Close", "CloseHold", "LiftTest"}:
+    if p in {"Align", "Descend", "Close", "CloseHold", "LiftTest"}:
         return [
             ("obs_descend_xy_error", "descend_xy_err"),
             ("obs_descend_z_error", "descend_z_err"),

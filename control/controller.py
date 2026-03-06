@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import mujoco
 
@@ -101,11 +102,22 @@ class EEController:
         self.gripper_switch_cooldown_steps = int(config["gripper_switch_cooldown_steps"])
         self.gripper_switch_cooldown = 0 
         self.debug_every_steps = int(config["debug_every_steps"])
+        self.ctrl_debug_always = str(os.getenv("CTRL_DEBUG_ALWAYS", "0")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         self.control_step = 0
         self.last_requested_move_norm = 0.0
         self.last_applied_move_norm = 0.0
         self.last_dq_norm_raw = 0.0
         self.last_dq_norm_applied = 0.0
+        self.last_xy_align_cos = float("nan")
+        self.last_xy_wrong_way = 0
+        self.last_xy_guard_applied = 0
+        self.xy_eval_count = 0
+        self.xy_wrong_way_count = 0
         self.prev_move_delta = np.zeros(3, dtype=float)
         self.gripper_object_width_estimate = None
 
@@ -196,6 +208,7 @@ class EEController:
             optional: "yaw_target": float (radians) or cardinal int {0,1,2,3},
             optional: "yaw_pi_symmetric": bool (treat yaw and yaw+pi as equivalent; pick shorter turn),
             optional: "enable_topdown_objective": bool,
+            optional: "allow_orientation_only": bool (permit yaw/topdown solve even when move ~= 0),
             optional: "position_gain_scale": float (>0),
             optional: "yaw_weight_scale": float (>0),
             optional: "topdown_weight_scale": float (>0),
@@ -214,6 +227,7 @@ class EEController:
         self._step_yaw_target = self._interpret_yaw_target(action.get("yaw_target", self.yaw_target))
         self._step_yaw_pi_symmetric = bool(action.get("yaw_pi_symmetric", False))
         self._step_enable_topdown = action.get("enable_topdown_objective", self.enable_topdown_objective)
+        self._step_allow_orientation_only = bool(action.get("allow_orientation_only", False))
         # Optional per-step gain scheduling (useful for softer grasp/place phases).
         self._step_position_gain_scale = float(np.clip(action.get("position_gain_scale", 1.0), 0.05, 2.0))
         self._step_yaw_weight_scale = float(np.clip(action.get("yaw_weight_scale", 1.0), 0.05, 2.0))
@@ -241,12 +255,24 @@ class EEController:
             open_target_override=open_target_override,
         )
         self.control_step += 1
-        if self.debug_every_steps > 0 and self.control_step % self.debug_every_steps == 0:
+        debug_due = self.debug_every_steps > 0 and self.control_step % self.debug_every_steps == 0
+        debug_trigger = bool(self.last_xy_wrong_way == 1 or self.last_xy_guard_applied == 1)
+        if debug_due and (self.ctrl_debug_always or debug_trigger):
+            xy_align = self.last_xy_align_cos
+            xy_align_str = f"{xy_align:+.2f}" if np.isfinite(xy_align) else "nan"
+            xy_wrong_rate = (
+                float(self.xy_wrong_way_count) / float(self.xy_eval_count)
+                if self.xy_eval_count > 0
+                else float("nan")
+            )
+            xy_wrong_rate_str = f"{xy_wrong_rate:.3f}" if np.isfinite(xy_wrong_rate) else "nan"
             print(
                 f"[CtrlDbg] step={self.control_step} "
                 f"req_move={self.last_requested_move_norm:.4f} "
                 f"applied_move={self.last_applied_move_norm:.4f} max_step={self.max_step:.4f} "
                 f"dq_raw={self.last_dq_norm_raw:.4f} dq_applied={self.last_dq_norm_applied:.4f} "
+                f"xy_align={xy_align_str} xy_wrong={int(self.last_xy_wrong_way)} "
+                f"xy_guard={int(self.last_xy_guard_applied)} xy_wrong_rate={xy_wrong_rate_str} "
                 f"max_joint_step={self.max_joint_step:.4f} "
                 f"scales=pos:{self._step_position_gain_scale:.2f},yaw:{self._step_yaw_weight_scale:.2f},"
                 f"top:{self._step_topdown_weight_scale:.2f},null:{self._step_nullspace_gain_scale:.2f} "
@@ -300,8 +326,12 @@ class EEController:
 
         ee_pos = self.simulator.get_ee_position()
         err_pos = np.array(target_pos, dtype=float) - ee_pos
-        if np.linalg.norm(err_pos) < self.ee_tolerance:
+        pos_err_norm = float(np.linalg.norm(err_pos))
+        allow_orientation_only = bool(getattr(self, "_step_allow_orientation_only", False))
+        if pos_err_norm < self.ee_tolerance and not allow_orientation_only:
             return
+        if pos_err_norm < self.ee_tolerance:
+            err_pos = np.zeros(3, dtype=float)
 
         jacp = np.zeros((3, model.nv))
         jacr = np.zeros((3, model.nv))
@@ -371,12 +401,35 @@ class EEController:
         # Safety guard: if full objective predicts XY motion away from target,
         # solve this step with translation-only objective.
         xy_demand = float(np.linalg.norm(err_pos[:2]))
+        self.last_xy_align_cos = float("nan")
+        self.last_xy_wrong_way = 0
+        self.last_xy_guard_applied = 0
         if xy_demand > 0.004:
             pred_delta = J_pos @ dq
-            if float(np.dot(pred_delta[:2], err_pos[:2])) < -1e-6:
+            xy_pred = np.asarray(pred_delta[:2], dtype=float)
+            xy_err = np.asarray(err_pos[:2], dtype=float)
+            xy_dot = float(np.dot(xy_pred, xy_err))
+            pred_norm = float(np.linalg.norm(xy_pred))
+            err_norm = float(np.linalg.norm(xy_err))
+            if pred_norm > 1e-9 and err_norm > 1e-9:
+                self.last_xy_align_cos = float(np.clip(xy_dot / (pred_norm * err_norm), -1.0, 1.0))
+            self.xy_eval_count += 1
+            if xy_dot < -1e-6:
                 dq_pos = _solve_dq(J_pos, err_pos)
                 if dq_pos is not None:
                     dq = dq_pos
+                    self.last_xy_guard_applied = 1
+                    pred_delta = J_pos @ dq
+                    xy_pred = np.asarray(pred_delta[:2], dtype=float)
+                    xy_dot = float(np.dot(xy_pred, xy_err))
+                    pred_norm = float(np.linalg.norm(xy_pred))
+                    if pred_norm > 1e-9 and err_norm > 1e-9:
+                        self.last_xy_align_cos = float(
+                            np.clip(xy_dot / (pred_norm * err_norm), -1.0, 1.0)
+                        )
+            if xy_dot < -1e-6:
+                self.last_xy_wrong_way = 1
+                self.xy_wrong_way_count += 1
 
         dq_norm = np.linalg.norm(dq)
         self.last_dq_norm_raw = float(dq_norm)
@@ -389,6 +442,21 @@ class EEController:
 
         data.ctrl[self.arm_actuator_ids] = q_target
         mujoco.mj_forward(model, data)
+
+    def get_consistency_snapshot(self):
+        xy_wrong_rate = (
+            float(self.xy_wrong_way_count) / float(self.xy_eval_count)
+            if self.xy_eval_count > 0
+            else float("nan")
+        )
+        return {
+            "xy_align_cos": float(self.last_xy_align_cos),
+            "xy_wrong_way": int(self.last_xy_wrong_way),
+            "xy_guard_applied": int(self.last_xy_guard_applied),
+            "xy_wrong_way_rate": float(xy_wrong_rate),
+            "xy_eval_count": int(self.xy_eval_count),
+            "xy_wrong_way_count": int(self.xy_wrong_way_count),
+        }
 
     def _apply_grip(self, grip_cmd, close_target_override=None, open_target_override=None):
         current_width = float(self.simulator.get_gripper_width())

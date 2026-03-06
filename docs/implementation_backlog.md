@@ -1,10 +1,9 @@
 # Implementation Backlog (AI-Only)
 
 This file is the single source for near-term engineering work.
-It replaces:
-- `docs/current_task_queue.md`
-- `docs/robotics_upgrade_plan.md`
-- `docs/recovery_failure_upgrade_plan.md`
+Consolidated note:
+1. Earlier planning docs were merged here and removed from the repo.
+2. Keep this file as the active execution backlog.
 
 ## Scope
 - Runtime: active-inference + BT only.
@@ -22,6 +21,9 @@ It replaces:
 9. `MoveToPlaceAbove` watchdog/progress timeout extension logic is active in baseline.
 10. Gripper open-ready gating is synchronized with controller dynamic open target each step.
 11. Place-above keeps topdown objective enabled while yaw objective is conditionally gated.
+12. Pick-side hold-stage cleanup completed:
+ - separate `PreGraspHold` phase removed
+ - merged `Align` settle gate in place (`align_settle_steps`, `align_settle_step`)
 
 ## Reverted Experiments (For Future Re-Test)
 These were tested and then reverted. Keep as reference so they can be re-applied later in a controlled A/B run.
@@ -114,6 +116,25 @@ This is intentionally deferred until current P0/P1 stability gates are passing.
 3. Add deterministic real-time execution/watchdog path for hardware control loop.
 4. Add stronger calibration and frame/latency compensation pipeline.
 5. Add hardware fault/degraded-mode handling (comm drop, actuator saturation, emergency stop path).
+
+### Future Track Detail: Collision/Singularity Safety Stack
+Target: avoid self-contact and unstable postures while preserving task completion.
+
+1. Add explicit self-collision distance checks (link-link and tool-link) with a configured safety margin.
+2. Add environment collision checks (table/object/fixtures) using inflated collision geometry for conservative clearance.
+3. Add command-time velocity scaling by minimum collision distance (slow down near constraints, not only hard-stop).
+4. Add singularity proximity monitor from Jacobian condition/velocity amplification metrics, with fallback posture behavior.
+5. Add joint-limit proximity penalties in nullspace to keep away from hard-limit corners.
+6. Add phase-aware safe waypoint policy (`lift -> translate -> descend`) as a hard preference for risky transitions.
+7. Add runtime guard metrics to batch reports:
+ - self-collision near-miss count
+ - environment near-miss count
+ - singularity warning count
+ - command scaling ratio distribution
+8. Define hardware-readiness gate:
+ - no collision events in validation matrix
+ - bounded singularity warnings
+ - stable cycle-time under guard load
 
 ## Validation Standard
 For each change set, compare at least 10 episodes:

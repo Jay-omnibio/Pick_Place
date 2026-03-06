@@ -1,5 +1,7 @@
 # Scenario Matrix (Real-Robot Style Validation)
 
+Last updated: 2026-03-04
+
 Use this to verify that tuning works across workspace and not only one easy pose.
 
 ## Goal
@@ -15,7 +17,7 @@ For each scenario:
 3. Run:
 
 ```bash
-python tools/run_batch_eval.py --episodes 10 --timeout-sec 240 --save-per-run-report
+python3 tools/run_batch_eval.py --episodes 10 --timeout-sec 240 --save-per-run-report
 ```
 
 4. Save batch summary path in your notes.
@@ -23,12 +25,16 @@ python tools/run_batch_eval.py --episodes 10 --timeout-sec 240 --save-per-run-re
 Optional automation (run multiple scenarios without editing XML each time):
 
 ```bash
-python tools/run_position_sweep.py ^
+python3 tools/run_position_sweep.py ^
   --scenarios "A1:0.40,0.00,0.20,0;A2:0.50,0.00,0.20,0;A3:0.60,0.00,0.20,0" ^
   --episodes 10 --timeout-sec 240 --save-per-run-report
 ```
 
 This uses env overrides (`OBJ_WORLD_XYZ`, `OBJ_WORLD_QUAT_WXYZ`) per scenario and writes a sweep summary in `logs/reports/`.
+
+Latest reference sweep:
+1. `logs/reports/position_sweep_20260301_134501.md`
+2. Use it as baseline when comparing new tuning changes.
 
 ## Pose Conventions
 - MuJoCo object quaternion in this file is `[w x y z]`.

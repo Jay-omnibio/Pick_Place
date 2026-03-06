@@ -115,6 +115,10 @@ def _parse_batch_summary(path: Path):
             "median_lifttest_step",
             "p90_lifttest_step",
             "hard_stuck_reach_count",
+            "first_try_reach",
+            "first_try_descend",
+            "first_try_preplace",
+            "first_try_place_descend",
         ):
             gate_lines[key] = gm.group(2).strip()
     return done_count, gate_lines
@@ -195,6 +199,10 @@ def main() -> None:
                 "reach_close_hold": gates.get("reach_close_hold", "-"),
                 "reach_stall_total": gates.get("reach_stall_total", "-"),
                 "hard_stuck_reach_count": gates.get("hard_stuck_reach_count", "-"),
+                "first_try_reach": gates.get("first_try_reach", "-"),
+                "first_try_descend": gates.get("first_try_descend", "-"),
+                "first_try_preplace": gates.get("first_try_preplace", "-"),
+                "first_try_place_descend": gates.get("first_try_place_descend", "-"),
                 "batch_report": str(batch_out).replace("\\", "/"),
                 "stdout_tail": "\n".join((cp.stdout or "").splitlines()[-6:]),
                 "stderr_tail": "\n".join((cp.stderr or "").splitlines()[-6:]),
@@ -213,14 +221,16 @@ def main() -> None:
     lines.append("## Results")
     lines.append(
         "| label | obj pose (x,y,z) | yaw_deg | status | done_count | reach_descend | "
-        "reach_close_hold | reach_stall_total | hard_stuck_reach_count | batch_report |"
+        "reach_close_hold | reach_stall_total | first_try_reach | first_try_preplace | "
+        "first_try_place_descend | hard_stuck_reach_count | batch_report |"
     )
-    lines.append("|---|---|---:|---|---:|---|---|---|---|---|")
+    lines.append("|---|---|---:|---|---:|---|---|---|---|---|---|---|")
     for r in rows:
         lines.append(
             f"| {r['label']} | ({r['x']:.3f},{r['y']:.3f},{r['z']:.3f}) | {r['yaw_deg']:.1f} | "
             f"{r['status']} | {r['done_count']} | {r['reach_descend']} | {r['reach_close_hold']} | "
-            f"{r['reach_stall_total']} | {r['hard_stuck_reach_count']} | {r['batch_report']} |"
+            f"{r['reach_stall_total']} | {r['first_try_reach']} | {r['first_try_preplace']} | "
+            f"{r['first_try_place_descend']} | {r['hard_stuck_reach_count']} | {r['batch_report']} |"
         )
 
     lines.append("")

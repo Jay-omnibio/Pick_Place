@@ -15,11 +15,41 @@ Core modules:
 
 The runtime is **active-inference only** (FSM mode removed).
 
+## Documentation Map
+
+- Architecture: `docs/ai_bt_architecture.md`
+- Project roadmap: `docs/project_roadmap.md`
+- Backlog and gates: `docs/implementation_backlog.md`
+- Scenario validation matrix: `docs/scenario_matrix.md`
+- Recovery/failure policy: `docs/recovery_failure_agreed_solutions.md`
+- Run commands: `docs/python3_run_commands.md`
+- Executive/meeting brief: `docs/ceo_project_brief.md`
+- 5-slide meeting deck: `docs/meeting_deck_5_slides.md`
+- Full concepts and layers explainer: `docs/system_concepts_and_layers.md`
+
 ## Assets and simulation setup
 
 - **panda_mocap.xml**: Put your Panda robot MuJoCo model in `assets/` as `assets/panda_mocap.xml`.
 - **Place target**: configured in `config/common_robot.yaml` under `task_shared`.
 - **Loop rate**: default control loop is ~50 Hz in `run_pick_place.py`.
+
+1. **Clone Dependencies**: 
+   The robot models are sourced from [Google DeepMind's MuJoCo Menagerie](https://github.com).
+   ```bash
+   git clone https://github.com/google-deepmind/mujoco_menagerie.git
+   ```
+
+### ⚙️ Configure Asset Paths
+
+MuJoCo requires correct relative paths to load meshes and textures. You must ensure `panda_mocap.xml` can find its assets:
+
+*   **Option A**: In `assets/panda_mocap.xml`, update the `<compiler meshdir="..." />` or individual asset paths to point to your local `mujoco_menagerie/franka_emika_panda/assets/` directory.
+*   **Option B**: Move/copy the `panda_mocap.xml` file directly into the `mujoco_menagerie/franka_emika_panda/` folder so it sits alongside its native assets.
+
+### ✅ Verify Main Import
+
+1.  Open `pick_and_place.xml`.
+2.  Check the `<include file="..." />` tag to ensure it correctly points to the location of your `panda_mocap.xml`.
 
 ## Run the simulation
 

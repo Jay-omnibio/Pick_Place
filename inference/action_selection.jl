@@ -55,7 +55,6 @@ function _phase_gain_scales(phase)
     table = Dict(
         :Reach => (1.00, 1.00, 1.00, 1.00),
         :Align => (0.85, 1.00, 1.00, 0.95),
-        :PreGraspHold => (0.70, 1.10, 1.10, 0.85),
         :Descend => (0.58, 1.15, 1.15, 0.80),
         :CloseHold => (0.40, 1.15, 1.10, 0.75),
         :Grasp => (0.40, 1.15, 1.10, 0.75),
@@ -156,7 +155,8 @@ function select_action(current_belief, params)
 
     grasp_step = Float64(_require(params, :grasp_step))
     align_step = Float64(_require(params, :align_step))
-    pregrasp_hold_step = Float64(_require(params, :pregrasp_hold_step))
+    align_threshold = Float64(_require(params, :align_threshold))
+    align_settle_step = Float64(_require(params, :align_settle_step))
     descend_x_threshold = Float64(_require(params, :descend_x_threshold))
     descend_y_threshold = Float64(_require(params, :descend_y_threshold))
     descend_z_threshold = Float64(_require(params, :descend_z_threshold))
@@ -216,6 +216,7 @@ function select_action(current_belief, params)
                 yaw_target = _object_yaw_target(current_belief),
                 yaw_pi_symmetric = true,
                 enable_topdown_objective = true,
+                allow_orientation_only = true,
             ), phase)
         end
 
@@ -287,44 +288,90 @@ function select_action(current_belief, params)
                 desired_move = (desired_move / desired_norm) * step_limit
             end
         end
-        return _attach_phase_gains((
+        # Option 3: apply gentle yaw guidance in Reach so Align has less orientation work.
+        # Keep it weak while far to avoid coupling into XY path.
+        reach_xy_err = norm(err[1:2])
+        yaw_scale = reach_xy_err > 0.06 ? 0.20 : (reach_xy_err > 0.03 ? 0.45 : 0.75)
+        phase_scales = _phase_gain_scales(:Reach)
+        phase_scales = merge(
+            phase_scales,
+            (yaw_weight_scale = min(yaw_scale, Float64(phase_scales.yaw_weight_scale)),),
+        )
+        return merge((
             move = desired_move,
             grip = -1,
-            enable_yaw_objective = false,
+            enable_yaw_objective = true,
+            yaw_target = _object_yaw_target(current_belief),
+            yaw_pi_symmetric = true,
             enable_topdown_objective = true,
-        ), phase)
+        ), phase_scales)
     elseif phase == :Align
         s_obj = Float64.(current_belief[:s_obj_mean])
         err = s_obj - align_obj_rel
+        align_err = norm(err)
         desired = [0.9 * err[1], 0.9 * err[2], 0.9 * err[3]]
         n = norm(desired)
         if n > align_step && n > 0.0
             desired = (desired / n) * align_step
         end
-        return _attach_phase_gains((
-            move = desired,
-            grip = -1,
-            enable_yaw_objective = true,
-            yaw_target = _object_yaw_target(current_belief),
-            yaw_pi_symmetric = true,
-            enable_topdown_objective = true,
-        ), phase)
-    elseif phase == :PreGraspHold
-        s_obj = Float64.(current_belief[:s_obj_mean])
-        err = s_obj - align_obj_rel
-        desired = [0.35 * err[1], 0.35 * err[2], 0.35 * err[3]]
-        n = norm(desired)
-        if n > pregrasp_hold_step && n > 0.0
-            desired = (desired / n) * pregrasp_hold_step
+        phase_scales = _phase_gain_scales(:Align)
+        allow_orientation_only = false
+        # Merged align-settle behavior:
+        # keep a tiny corrective motion near threshold, then finish with orientation-only
+        # when already very close.
+        if align_err <= (0.5 * align_threshold)
+            desired = [0.0, 0.0, 0.0]
+            allow_orientation_only = true
+            phase_scales = merge(
+                phase_scales,
+                (
+                    position_gain_scale = 0.20,
+                    yaw_weight_scale = max(1.35, Float64(phase_scales.yaw_weight_scale)),
+                    topdown_weight_scale = max(1.05, Float64(phase_scales.topdown_weight_scale)),
+                ),
+            )
+        elseif align_err <= align_threshold
+            desired = [0.35 * err[1], 0.35 * err[2], 0.35 * err[3]]
+            n_hold = norm(desired)
+            settle_step = max(1e-6, align_settle_step)
+            if n_hold > settle_step && n_hold > 0.0
+                desired = (desired / n_hold) * settle_step
+            end
+            phase_scales = merge(
+                phase_scales,
+                (
+                    position_gain_scale = min(
+                        Float64(phase_scales.position_gain_scale),
+                        0.70,
+                    ),
+                    yaw_weight_scale = max(
+                        Float64(phase_scales.yaw_weight_scale),
+                        1.10,
+                    ),
+                    topdown_weight_scale = max(
+                        Float64(phase_scales.topdown_weight_scale),
+                        1.10,
+                    ),
+                ),
+            )
+        elseif align_err <= (1.5 * align_threshold)
+            phase_scales = merge(
+                phase_scales,
+                (
+                    position_gain_scale = min(0.70, Float64(phase_scales.position_gain_scale)),
+                    yaw_weight_scale = max(1.20, Float64(phase_scales.yaw_weight_scale)),
+                ),
+            )
         end
-        return _attach_phase_gains((
+        return merge((
             move = desired,
             grip = -1,
             enable_yaw_objective = true,
             yaw_target = _object_yaw_target(current_belief),
             yaw_pi_symmetric = true,
             enable_topdown_objective = true,
-        ), phase)
+            allow_orientation_only = allow_orientation_only,
+        ), phase_scales)
     elseif phase == :Descend
         s_obj = Float64.(current_belief[:s_obj_mean])
         err = s_obj - descend_obj_rel

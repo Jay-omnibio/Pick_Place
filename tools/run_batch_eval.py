@@ -10,12 +10,26 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 
 SAVED_LOG_RE = re.compile(r"Saved run log:\s*(?P<path>\S+\.csv)")
+
+# Phase edges used to evaluate first-try pass behavior.
+PHASE_FIRST_TRY_EDGES: List[Tuple[str, str]] = [
+    ("Reach", "Align"),
+    ("Align", "Descend"),
+    ("Descend", "CloseHold"),
+    ("CloseHold", "LiftTest"),
+    ("LiftTest", "Transit"),
+    ("Transit", "MoveToPlaceAbove"),
+    ("MoveToPlaceAbove", "DescendToPlace"),
+    ("DescendToPlace", "Open"),
+    ("Open", "Retreat"),
+    ("Retreat", "Done"),
+]
 
 
 @dataclass
@@ -41,6 +55,8 @@ class RunResult:
     reach_stall_retries: int
     recovery_events: int
     failure_reason: str
+    phase_attempts: Dict[str, int]
+    phase_first_try_pass: Dict[str, int]
     stdout_tail: str
     stderr_tail: str
 
@@ -174,6 +190,37 @@ def _last_nonempty(rows: List[dict], key: str) -> str:
     return out
 
 
+def _phase_attempts_and_first_try(rows: List[dict]) -> Tuple[Dict[str, int], Dict[str, int]]:
+    attempts = {phase: 0 for phase, _ in PHASE_FIRST_TRY_EDGES}
+    pass_transition = {phase: 0 for phase, _ in PHASE_FIRST_TRY_EDGES}
+    if not rows:
+        return attempts, pass_transition
+
+    transitions: List[Tuple[str, str]] = []
+    prev = None
+    for r in rows:
+        cur = str(r.get("phase", "")).strip()
+        if not cur:
+            continue
+        if prev is None:
+            transitions.append(("START", cur))
+        elif cur != prev:
+            transitions.append((prev, cur))
+        prev = cur
+
+    for _, to_phase in transitions:
+        if to_phase in attempts:
+            attempts[to_phase] += 1
+    for from_phase, to_phase in transitions:
+        if (from_phase, to_phase) in PHASE_FIRST_TRY_EDGES:
+            pass_transition[from_phase] = 1
+
+    first_try = {}
+    for phase, _ in PHASE_FIRST_TRY_EDGES:
+        first_try[phase] = int(attempts.get(phase, 0) == 1 and pass_transition.get(phase, 0) == 1)
+    return attempts, first_try
+
+
 def _find_csv_from_output(text: str, repo_root: Path, logs_dir: Path) -> Optional[Path]:
     m = SAVED_LOG_RE.search(text)
     if not m:
@@ -262,6 +309,8 @@ def _run_single(
     reach_stall_retries = 0
     recovery_events = 0
     failure_reason = ""
+    phase_attempts = {phase: 0 for phase, _ in PHASE_FIRST_TRY_EDGES}
+    phase_first_try_pass = {phase: 0 for phase, _ in PHASE_FIRST_TRY_EDGES}
 
     if csv_path is not None and csv_path.exists():
         rows = _load_rows(csv_path)
@@ -283,6 +332,7 @@ def _run_single(
             reach_stall_retries = _count_reason_events(rows, "ai_retry_reason", "reach_stall")
             recovery_events = _recovery_events(rows)
             failure_reason = _last_nonempty(rows, "ai_failure_reason")
+            phase_attempts, phase_first_try_pass = _phase_attempts_and_first_try(rows)
 
         if save_per_run_report:
             diag_cmd = [
@@ -332,6 +382,8 @@ def _run_single(
         reach_stall_retries=reach_stall_retries,
         recovery_events=recovery_events,
         failure_reason=failure_reason,
+        phase_attempts=phase_attempts,
+        phase_first_try_pass=phase_first_try_pass,
         stdout_tail=_short_tail(stdout),
         stderr_tail=_short_tail(stderr),
     )
@@ -405,19 +457,55 @@ def _write_summary(
         f"{gates['hard_stuck_reach']}"
     )
     lines.append("")
+    lines.append("## Phase First-Try Pass")
+    lines.append("| phase | entered_runs | first_try_pass | pass_rate | avg_attempts_when_entered |")
+    lines.append("|---|---:|---:|---:|---:|")
+    for phase, _ in PHASE_FIRST_TRY_EDGES:
+        entered_runs = int(sum(1 for r in results if int(r.phase_attempts.get(phase, 0)) > 0))
+        first_try_pass = int(sum(int(r.phase_first_try_pass.get(phase, 0)) for r in results))
+        if entered_runs > 0:
+            pass_rate = float(first_try_pass) / float(entered_runs)
+            avg_attempts = float(
+                np.mean([int(r.phase_attempts.get(phase, 0)) for r in results if int(r.phase_attempts.get(phase, 0)) > 0])
+            )
+            pass_rate_s = f"{pass_rate:.2f}"
+            avg_attempts_s = f"{avg_attempts:.2f}"
+        else:
+            pass_rate_s = "-"
+            avg_attempts_s = "-"
+        lines.append(
+            f"| {phase} | {entered_runs} | {first_try_pass} | {pass_rate_s} | {avg_attempts_s} |"
+        )
+    lines.append("")
+    # Compact key stats for sweep parser.
+    for phase_key, out_key in (
+        ("Reach", "first_try_reach"),
+        ("Descend", "first_try_descend"),
+        ("MoveToPlaceAbove", "first_try_preplace"),
+        ("DescendToPlace", "first_try_place_descend"),
+    ):
+        entered_runs = int(sum(1 for r in results if int(r.phase_attempts.get(phase_key, 0)) > 0))
+        first_try_pass = int(sum(int(r.phase_first_try_pass.get(phase_key, 0)) for r in results))
+        lines.append(f"- {out_key}: {first_try_pass}/{entered_runs}")
+    lines.append("")
     lines.append("## Per Run")
     lines.append(
         "| run | status | phase | step_done | step_lifttest | reach_max_rows | "
-        "reach_stall_retries | recoveries | csv | report |"
+        "reach_stall_retries | recoveries | reach_1st | descend_1st | preplace_1st | place_1st | csv | report |"
     )
-    lines.append("|---|---|---|---:|---:|---:|---:|---:|---|---|")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
     for r in results:
         csv_short = str(r.csv_path).replace("\\", "/") if r.csv_path else "-"
         rep_short = str(r.report_path).replace("\\", "/") if r.report_path else "-"
         lines.append(
             f"| {r.run_index} | {r.status} | {r.final_phase or '-'} | {_fmt_opt(r.step_done)} | "
             f"{_fmt_opt(r.step_lift_test)} | {int(r.reach_max_consecutive_rows)} | "
-            f"{int(r.reach_stall_retries)} | {int(r.recovery_events)} | {csv_short} | {rep_short} |"
+            f"{int(r.reach_stall_retries)} | {int(r.recovery_events)} | "
+            f"{int(r.phase_first_try_pass.get('Reach', 0))} | "
+            f"{int(r.phase_first_try_pass.get('Descend', 0))} | "
+            f"{int(r.phase_first_try_pass.get('MoveToPlaceAbove', 0))} | "
+            f"{int(r.phase_first_try_pass.get('DescendToPlace', 0))} | "
+            f"{csv_short} | {rep_short} |"
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -39,3 +39,8 @@
 ## Design Notes
 - `docs/ai_bt_partwise_findings.md`: deep part-by-part status review and priorities.
 - `docs/non_direct_path_compensations.md`: map of non-direct-path behavior logic and tuning knobs.
+- `docs/recovery_failure_agreed_solutions.md`: agreed BT/phase recovery policy and planned routing improvements.
+- `docs/implementation_backlog.md`: active execution backlog, gates, and future real-robot hardening track.
+- `docs/ceo_project_brief.md`: executive-level project summary for stakeholder meetings.
+- `docs/meeting_deck_5_slides.md`: ready-to-present 5-slide markdown deck for management meetings.
+- `docs/system_concepts_and_layers.md`: full concept and layer-by-layer architecture explanation.
