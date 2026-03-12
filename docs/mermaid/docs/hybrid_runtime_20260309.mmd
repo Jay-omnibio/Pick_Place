@@ -1,0 +1,39 @@
+flowchart LR
+  subgraph H1[Layer 1 - BT Task Nodes]
+    PICK[PICK]
+    PLACE[PLACE]
+    REC[RECOVER]
+    FAIL[FAILURE]
+    SAFE[SAFE_STOP]
+  end
+
+  subgraph H2[Layer 2 - Phase Managers]
+    PMR[Phase Router]
+    PPM[Pick Phase Manager]
+    PLM[Place Phase Manager]
+  end
+
+  subgraph H3[Layer 3 - Active Inference]
+    IB2[infer_beliefs]
+    SA2[select_action]
+  end
+
+  subgraph H4[Layer 4/5 - Execution]
+    CTRL2[Controller + Safety]
+    SIM2[Robot/Simulator]
+    OBS2[Observations]
+  end
+
+  PICK --> PMR
+  PLACE --> PMR
+  REC --> PMR
+  PMR --> PPM
+  PMR --> PLM
+  PPM --> IB2
+  PLM --> IB2
+  OBS2 --> IB2 --> SA2 --> CTRL2 --> SIM2 --> OBS2
+
+  REC -->|retry exhausted| FAIL
+  PICK -->|safety| SAFE
+  PLACE -->|safety| SAFE
+

@@ -16,6 +16,9 @@ inference:
   align_max_steps: 300                      # Max steps allowed in Align.
   align_min_steps: 3                        # Fast profile: shorter minimum align dwell.
   align_settle_steps: 4                     # Consecutive settle-ready steps before Align -> Descend.
+  align_pick_yaw_gate_enabled: true         # Require yaw alignment during Align before Descend.
+  align_pick_yaw_threshold_deg: 10.0        # Max |EE yaw - pick yaw target| for Align -> Descend.
+  align_pick_yaw_hold_steps: 6              # Consecutive yaw-good steps required in Align.
   descend_max_steps: 1000                   # Base Descend timeout budget.
 
   # ---------- Descend strict axis thresholds ----------
@@ -34,6 +37,9 @@ inference:
   descend_stall_steps: 300                  # No-progress steps before treated as stall.
   descend_timeout_extension_steps: 80       # Extra steps granted when still improving.
   descend_max_timeout_extensions: 3         # Max number of timeout extensions.
+  descend_watchdog_trigger_steps: 120       # Trigger internal descend correction mode before hard timeout.
+  descend_watchdog_hold_steps: 60           # How long to keep descend correction mode active once triggered.
+  descend_watchdog_misaligned_contact: true # Trigger correction mode if contact appears while XY is still misaligned.
 
   # ---------- Close/Lift/Test behavior ----------
   close_hold_steps: 12                      # Fast profile: shorter close-hold dwell.
@@ -145,6 +151,24 @@ inference:
   place_descend_timeout_extension_steps: 30 # Extra steps granted when still improving near timeout.
   place_descend_max_timeout_extensions: 2   # Max timeout extensions in DescendToPlace.
   place_reapproach_max_retries: 2           # Max MoveToPlaceAbove->DescendToPlace re-approaches before Failure.
+  # Cross-side transfer assist (optional):
+  # When pick-side and place-side are opposite in base X, route via a safer waypoint.
+  place_cross_side_via_enabled: true
+  place_cross_side_x_gate: 0.06             # Min |x| on both ends to classify as cross-side transfer.
+  place_cross_side_via_y_offset: 0.26       # Via waypoint lateral offset from base center.
+  place_cross_side_via_x_bias: 0.00         # Optional X bias for via waypoint (world frame).
+  place_cross_side_via_z: 0.34              # Via waypoint Z clearance (world frame).
+  place_cross_side_via_xy_threshold: 0.06   # Consider via waypoint reached when XY error is below this.
+
+  # Keepout-zone assist (optional):
+  # Soft repulsion away from robot-body center while in place-side motion phases.
+  place_keepout_enabled: true
+  place_keepout_center_x: 0.00
+  place_keepout_center_y: 0.00
+  place_keepout_radius: 0.20                # Protected radius around keepout center (meters).
+  place_keepout_margin: 0.08                # Repulsion influence margin outside protected radius.
+  place_keepout_push_gain: 0.030            # Base outward XY push gain.
+  place_keepout_max_push: 0.018             # Cap on per-step keepout XY push.
   transit_height: 0.35                      # Safe height before moving to place.
   transit_z_threshold: 0.02                 # Transit completion tolerance on Z.
   open_hold_steps: 35                       # Fast profile: shorter hold-open duration.

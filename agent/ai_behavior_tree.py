@@ -5,6 +5,13 @@ from enum import Enum
 from typing import Dict, List
 import numpy as np
 
+from agent.phase_managers import (
+    PickPhaseManager,
+    PlacePhaseManager,
+    TERMINAL_FAILURE_PHASES as TERMINAL_FAILURE_PHASE_SET,
+    TERMINAL_SUCCESS_PHASES as TERMINAL_SUCCESS_PHASE_SET,
+)
+
 
 class BTStatus(str, Enum):
     RUNNING = "RUNNING"
@@ -101,11 +108,13 @@ class SetPlacePriorsNode(BTNode):
 
 
 class AIPickPlaceBehaviorTree:
-    PICK_PHASES = ("Reach", "Align", "Descend", "CloseHold", "LiftTest")
-    PLACE_PHASES = ("Transit", "MoveToPlaceAbove", "DescendToPlace", "Open", "Retreat")
-    TERMINAL_SUCCESS_PHASES = ("Done",)
-    TERMINAL_FAILURE_PHASES = ("Failure",)
+    PICK_PHASES = PickPhaseManager.INFO.phases
+    PLACE_PHASES = PlacePhaseManager.INFO.phases
+    TERMINAL_SUCCESS_PHASES = TERMINAL_SUCCESS_PHASE_SET
+    TERMINAL_FAILURE_PHASES = TERMINAL_FAILURE_PHASE_SET
     RECOVERY_BRANCHES = ("ReScanTable", "ReApproachOffset", "SafeBackoff")
+    TASK_INTENTS = ("PICK", "PLACE", "RECOVER", "DONE", "FAILURE")
+    BT_DECISIONS = ("CONTINUE", "RECOVER", "TASK_SWITCH", "SUCCESS", "TERMINAL_FAILURE")
 
     def __init__(
         self,
@@ -177,6 +186,33 @@ class AIPickPlaceBehaviorTree:
         if arr.shape[0] != 3 or not np.all(np.isfinite(arr)):
             return None
         return arr.copy()
+
+    def task_intent_for_phase(self, phase: str) -> str:
+        phase = str(phase or "Reach")
+        if phase in self.PICK_PHASES:
+            return "PICK"
+        if phase in self.PLACE_PHASES:
+            return "PLACE"
+        if phase in self.TERMINAL_SUCCESS_PHASES:
+            return "DONE"
+        if phase in self.TERMINAL_FAILURE_PHASES:
+            return "FAILURE"
+        return "PICK"
+
+    @staticmethod
+    def _make_tick_result(
+        *,
+        recover: bool,
+        terminal_failure: bool,
+        task_intent: str,
+        bt_decision: str,
+    ) -> Dict:
+        return {
+            "recover": bool(recover),
+            "terminal_failure": bool(terminal_failure),
+            "task_intent": str(task_intent),
+            "bt_decision": str(bt_decision),
+        }
 
     def _ensure_base_priors(self, belief: Dict) -> None:
         if self.base_priors:
@@ -406,6 +442,7 @@ class AIPickPlaceBehaviorTree:
 
     def tick(self, belief: Dict) -> Dict:
         phase = str(belief.get("phase", "Reach"))
+        phase_task_intent = self.task_intent_for_phase(phase)
         self.recover_requested = False
         self.last_reason = ""
 
@@ -416,6 +453,8 @@ class AIPickPlaceBehaviorTree:
         belief["recovery_branch_retry"] = int(
             self.branch_retry_counts.get(self.active_recovery_branch, 0)
         )
+        belief["task_intent"] = str(phase_task_intent)
+        belief["bt_decision"] = "CONTINUE"
 
         if self.active_branch_steps_remaining > 0:
             self.active_branch_steps_remaining -= 1
@@ -425,31 +464,67 @@ class AIPickPlaceBehaviorTree:
         if phase in self.TERMINAL_SUCCESS_PHASES:
             self.status = BTStatus.SUCCESS
             self._clear_active_recovery_branch()
-            return {"recover": False, "terminal_failure": False}
+            return self._make_tick_result(
+                recover=False,
+                terminal_failure=False,
+                task_intent="DONE",
+                bt_decision="SUCCESS",
+            )
 
         if phase in self.TERMINAL_FAILURE_PHASES:
             self.status = BTStatus.FAILURE
             self.last_reason = str(belief.get("failure_reason", "phase_failure") or "phase_failure")
             self._clear_active_recovery_branch()
-            return {"recover": False, "terminal_failure": True}
+            return self._make_tick_result(
+                recover=False,
+                terminal_failure=True,
+                task_intent="FAILURE",
+                bt_decision="TERMINAL_FAILURE",
+            )
+
+        if str(belief.get("task_switch_event", "")).strip() == "object_dropped":
+            self.last_reason = "object_dropped"
+            self.recover_requested = True
+            self.status = BTStatus.RUNNING
+            return self._make_tick_result(
+                recover=True,
+                terminal_failure=False,
+                task_intent="PICK",
+                bt_decision="TASK_SWITCH",
+            )
 
         if int(belief.get("obs_stale_warn", 0)) == 1:
             self.last_reason = "stale_observation"
             self.recover_requested = True
             self.status = BTStatus.RUNNING
-            return {"recover": True, "terminal_failure": False}
+            return self._make_tick_result(
+                recover=True,
+                terminal_failure=False,
+                task_intent="RECOVER",
+                bt_decision="RECOVER",
+            )
 
         if int(belief.get("risk_singularity_warn", 0)) == 1:
             self.last_reason = "singularity_risk"
             self.recover_requested = True
             self.status = BTStatus.RUNNING
-            return {"recover": True, "terminal_failure": False}
+            return self._make_tick_result(
+                recover=True,
+                terminal_failure=False,
+                task_intent="RECOVER",
+                bt_decision="RECOVER",
+            )
 
         if int(belief.get("risk_unexpected_contact_warn", 0)) == 1:
             self.last_reason = "unexpected_contact"
             self.recover_requested = True
             self.status = BTStatus.RUNNING
-            return {"recover": True, "terminal_failure": False}
+            return self._make_tick_result(
+                recover=True,
+                terminal_failure=False,
+                task_intent="RECOVER",
+                bt_decision="RECOVER",
+            )
 
         if self.vfe_recover_enabled:
             vfe = float(belief.get("vfe_total", 0.0))
@@ -461,7 +536,12 @@ class AIPickPlaceBehaviorTree:
                 self.last_reason = "high_vfe"
                 self.recover_requested = True
                 self.status = BTStatus.RUNNING
-                return {"recover": True, "terminal_failure": False}
+                return self._make_tick_result(
+                    recover=True,
+                    terminal_failure=False,
+                    task_intent="RECOVER",
+                    bt_decision="RECOVER",
+                )
         else:
             self.vfe_high_steps = 0
 
@@ -469,34 +549,103 @@ class AIPickPlaceBehaviorTree:
             self.last_reason = self._stall_reason(phase)
             self.recover_requested = True
             self.status = BTStatus.RUNNING
-            return {"recover": True, "terminal_failure": False}
+            return self._make_tick_result(
+                recover=True,
+                terminal_failure=False,
+                task_intent="RECOVER",
+                bt_decision="RECOVER",
+            )
 
         result = self.root.tick(BTContext(phase=phase, belief=belief), self)
         if result == BTStatus.SUCCESS:
             self.status = BTStatus.SUCCESS
             self._clear_active_recovery_branch()
-            return {"recover": False, "terminal_failure": False}
+            return self._make_tick_result(
+                recover=False,
+                terminal_failure=False,
+                task_intent="DONE",
+                bt_decision="SUCCESS",
+            )
 
         self.status = BTStatus.RUNNING
         if self.recover_requested:
-            return {"recover": True, "terminal_failure": False}
-        return {"recover": False, "terminal_failure": False}
+            return self._make_tick_result(
+                recover=True,
+                terminal_failure=False,
+                task_intent="RECOVER",
+                bt_decision="RECOVER",
+            )
+        return self._make_tick_result(
+            recover=False,
+            terminal_failure=False,
+            task_intent=phase_task_intent,
+            bt_decision="CONTINUE",
+        )
 
     def recover_belief(self, belief: Dict) -> Dict:
         next_belief = dict(belief)
         reason = str(self.last_reason or "tree_failure")
+        next_belief["bt_decision"] = "RECOVER"
         next_belief["last_retry_reason"] = reason
         next_belief["failure_reason"] = ""
+
+        if reason == "object_dropped":
+            pick_entry = str(PickPhaseManager.retry_entry_phase())
+            next_belief["bt_decision"] = "TASK_SWITCH"
+            next_belief["phase"] = pick_entry
+            next_belief["task_intent"] = "PICK"
+            next_belief["requested_task_intent"] = "PICK"
+            next_belief["task_switch_event"] = "object_dropped"
+            next_belief["retry_scope"] = "BT_TASK_SWITCH"
+            # Start fresh retry budget after explicit task switch PLACE->PICK.
+            next_belief["retry_count"] = 0
+            next_belief["reach_cooldown"] = self.reach_reentry_cooldown_steps
+            next_belief["reach_best_error"] = float("inf")
+            next_belief["reach_no_progress_steps"] = 0
+            next_belief["reach_watchdog_active"] = 0
+            next_belief["reach_yaw_align_active"] = 0
+            next_belief["reach_yaw_align_timer"] = 0
+            next_belief["reach_yaw_align_done"] = 0
+            next_belief["align_timer"] = 0
+            next_belief["align_settle_counter"] = 0
+            next_belief["descend_timer"] = 0
+            next_belief["descend_best_error"] = float("inf")
+            next_belief["descend_no_progress_steps"] = 0
+            next_belief["descend_timeout_extensions"] = 0
+            next_belief["close_hold_timer"] = 0
+            next_belief["lift_test_timer"] = 0
+            next_belief["transit_timer"] = 0
+            next_belief["open_timer"] = 0
+            next_belief["retreat_timer"] = 0
+            next_belief["release_detach_counter"] = 0
+            next_belief["release_stable_counter"] = 0
+            next_belief["place_descend_timer"] = 0
+            next_belief["place_descend_best_error"] = float("inf")
+            next_belief["place_descend_no_progress_steps"] = 0
+            next_belief["place_descend_timeout_extensions"] = 0
+            next_belief["place_reapproach_count"] = 0
+            next_belief["release_reapproach_count"] = 0
+            self.place_started = False
+            self.phase_steps = 0
+            self.phase_best_error = float("inf")
+            self.phase_no_progress_steps = 0
+            self.last_phase = pick_entry
+            self.vfe_high_steps = 0
+            self._clear_active_recovery_branch()
+            return next_belief
+
         retries = int(next_belief.get("retry_count", 0)) + 1
         self.global_recovery_count += 1
         next_belief["retry_count"] = retries
         next_belief["recovery_global_count"] = int(self.global_recovery_count)
+        next_belief["retry_scope"] = "BT_RECOVERY"
 
         if retries > self.max_retries:
             next_belief["phase"] = "Failure"
             next_belief["failure_reason"] = reason
             next_belief["recovery_branch"] = "Failure"
             next_belief["recovery_branch_retry"] = 0
+            next_belief["task_intent"] = "FAILURE"
             self.status = BTStatus.FAILURE
             self.place_started = False
             self.last_reason = f"max_retries_exceeded:{retries}>{self.max_retries}"
@@ -508,6 +657,7 @@ class AIPickPlaceBehaviorTree:
             next_belief["failure_reason"] = "retry_budget_exceeded"
             next_belief["recovery_branch"] = "Failure"
             next_belief["recovery_branch_retry"] = 0
+            next_belief["task_intent"] = "FAILURE"
             self.status = BTStatus.FAILURE
             self.place_started = False
             self.last_reason = (
@@ -522,6 +672,7 @@ class AIPickPlaceBehaviorTree:
             next_belief["failure_reason"] = "branch_retry_budget_exceeded"
             next_belief["recovery_branch"] = "Failure"
             next_belief["recovery_branch_retry"] = 0
+            next_belief["task_intent"] = "FAILURE"
             self.status = BTStatus.FAILURE
             self.place_started = False
             self.last_reason = "branch_retry_budget_exceeded"
@@ -533,12 +684,15 @@ class AIPickPlaceBehaviorTree:
         next_belief["recovery_branch_retry"] = int(self.branch_retry_counts[branch])
         self._activate_recovery_branch(branch, next_belief)
 
-        cur_phase = str(next_belief.get("phase", "Reach"))
+        cur_phase = str(next_belief.get("phase", PickPhaseManager.entry_phase()))
         has_grasp = int(next_belief.get("s_grasp", 0)) == 1
         place_side_failure = reason in ("place_alignment_failed", "release_failed")
+        place_retry_phase = str(PlacePhaseManager.retry_entry_phase())
+        pick_retry_phase = str(PickPhaseManager.retry_entry_phase())
         if place_side_failure and cur_phase in self.PLACE_PHASES and has_grasp:
             # Keep object grasped and retry from place-approach, not pick-reach.
-            next_belief["phase"] = "MoveToPlaceAbove"
+            next_belief["phase"] = place_retry_phase
+            next_belief["task_intent"] = "PLACE"
             next_belief["transit_timer"] = 0
             next_belief["open_timer"] = 0
             next_belief["retreat_timer"] = 0
@@ -551,11 +705,12 @@ class AIPickPlaceBehaviorTree:
             self.phase_steps = 0
             self.phase_best_error = float("inf")
             self.phase_no_progress_steps = 0
-            self.last_phase = "MoveToPlaceAbove"
+            self.last_phase = place_retry_phase
             self.vfe_high_steps = 0
             return next_belief
 
-        next_belief["phase"] = "Reach"
+        next_belief["phase"] = pick_retry_phase
+        next_belief["task_intent"] = "PICK"
         if branch == "ReScanTable":
             next_belief["reach_cooldown"] = max(
                 self.reach_reentry_cooldown_steps, self.rescan_hold_steps
@@ -596,6 +751,6 @@ class AIPickPlaceBehaviorTree:
         self.phase_steps = 0
         self.phase_best_error = float("inf")
         self.phase_no_progress_steps = 0
-        self.last_phase = "Reach"
+        self.last_phase = pick_retry_phase
         self.vfe_high_steps = 0
         return next_belief

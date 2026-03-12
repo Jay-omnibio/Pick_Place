@@ -15,6 +15,7 @@ class SensorSuite:
 
     def __init__(self, config):
         self.ee_noise_std = config["ee_sensor"]["noise_std"]
+        self.ee_yaw_axis = int(config.get("ee_sensor", {}).get("yaw_axis", 0))
         self.obj_noise_std = config["object_sensor"]["noise_std"]
         self.obj_yaw_noise_std = config["object_sensor"].get("yaw_noise_std", 0.0)
         self.target_noise_std = config.get("target_sensor", {}).get(
@@ -37,6 +38,7 @@ class SensorSuite:
         obj_obs = self._sense_object_relative(sim_state)
         target_obs = self._sense_target_relative(sim_state)
         obj_yaw_obs = self._sense_object_yaw(sim_state)
+        ee_yaw_obs = self._sense_ee_yaw(sim_state)
         grip_obs = self._sense_gripper(sim_state)
         contact_obs = self._sense_contact(sim_state)
         obs_time = float(sim_state.get("sim_time", 0.0))
@@ -46,6 +48,7 @@ class SensorSuite:
             "o_obj": obj_obs,
             "o_target": target_obs,
             "o_obj_yaw": obj_yaw_obs,
+            "o_ee_yaw": ee_yaw_obs,
             "o_grip": grip_obs,
             "o_contact": contact_obs,
             "o_timestamp": obs_time,
@@ -103,6 +106,23 @@ class SensorSuite:
         if self.obj_yaw_noise_std > 0.0:
             yaw += float(np.random.normal(0.0, self.obj_yaw_noise_std))
         return float(yaw)
+
+    def _sense_ee_yaw(self, sim_state):
+        """
+        End-effector yaw around world Z (radians).
+        Prefer EE-site orientation axis (same definition as controller yaw term).
+        Fallback to hand-body quaternion yaw if site matrix is unavailable.
+        """
+        if "ee_site_xmat" in sim_state:
+            try:
+                xmat = np.asarray(sim_state.get("ee_site_xmat"), dtype=float).reshape(3, 3)
+                axis_idx = int(np.clip(self.ee_yaw_axis, 0, 2))
+                v = xmat[:, axis_idx]
+                return float(np.arctan2(float(v[1]), float(v[0])))
+            except (TypeError, ValueError):
+                pass
+        quat = sim_state.get("hand_quat_wxyz", [1.0, 0.0, 0.0, 0.0])
+        return float(self._quat_wxyz_to_yaw(quat))
 
     def _sense_gripper(self, sim_state):
         """

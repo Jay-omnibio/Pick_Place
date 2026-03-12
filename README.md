@@ -18,14 +18,40 @@ The runtime is **active-inference only** (FSM mode removed).
 ## Documentation Map
 
 - Architecture: `docs/ai_bt_architecture.md`
+- Current vs hybrid architecture graphs: `docs/architecture_graphs_current_vs_hybrid.md`
+- BT/phase design-lock draft: `docs/bt_phase_architecture_draft.md`
 - Project roadmap: `docs/project_roadmap.md`
 - Backlog and gates: `docs/implementation_backlog.md`
 - Scenario validation matrix: `docs/scenario_matrix.md`
 - Recovery/failure policy: `docs/recovery_failure_agreed_solutions.md`
 - Run commands: `docs/python3_run_commands.md`
-- Executive/meeting brief: `docs/ceo_project_brief.md`
+- Executive/meeting brief: `docs/project_brief.md`
 - 5-slide meeting deck: `docs/meeting_deck_5_slides.md`
 - Full concepts and layers explainer: `docs/system_concepts_and_layers.md`
+
+## Release Notes (2026-03-12)
+
+- BT task-switch path for place-side drop is active:
+  - emits `object_dropped`
+  - switches task intent to `PICK`
+  - routes back to pick entry (`Reach`)
+  - resets `retry_count` on this task switch
+- Align yaw gate added before `Align -> Descend`:
+  - uses `align_pick_yaw_gate_enabled`
+  - `align_pick_yaw_threshold_deg`
+  - `align_pick_yaw_hold_steps`
+- EE yaw observation (`o_ee_yaw`) now aligns with controller yaw definition (EE-site axis via `yaw_axis`).
+- Reach uses translation-first orientation policy:
+  - yaw objective is reduced/disabled while far
+  - final yaw-align hold near transition remains active
+  - topdown objective stays enabled with distance-based `topdown_weight_scale`
+- Place keepout logic hardened:
+  - no-reentry projection in keepout zone
+  - keepout applied after local move search too
+- `MoveToPlaceAbove` topdown emphasis increased for this release.
+- CSV runtime logs now include:
+  - `ai_belief_ee_yaw`
+  - `ai_align_pick_yaw_error`
 
 ## Assets and simulation setup
 

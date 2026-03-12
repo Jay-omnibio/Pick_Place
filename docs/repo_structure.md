@@ -6,6 +6,8 @@
 ## Agent and Decision
 - `agent/agent_loop.py`: closed-loop runtime (`sense -> infer -> BT -> action -> act`).
 - `agent/ai_behavior_tree.py`: phase orchestration and recovery branching.
+- `agent/phase_router.py`: task-intent routing scaffold (`PICK`/`PLACE`/`RECOVER` mapping).
+- `agent/phase_managers.py`: pick/place phase ownership constants and entry-phase helpers.
 - `inference_interface.py`: belief update integration point.
 - `inference/action_selection.py`: action selection logic.
 - `inference/action_selection.jl`: optional Julia path.
@@ -36,11 +38,18 @@
 - `tools/run_position_sweep.py`: multi-scenario object-pose sweep runner.
 - `logs/`: generated CSVs and plots.
 
+Recent observability additions:
+- `ai_belief_ee_yaw`
+- `ai_align_pick_yaw_error`
+- retry-scope/event fields for BT recovery vs task-switch tracing.
+
 ## Design Notes
 - `docs/ai_bt_partwise_findings.md`: deep part-by-part status review and priorities.
 - `docs/non_direct_path_compensations.md`: map of non-direct-path behavior logic and tuning knobs.
 - `docs/recovery_failure_agreed_solutions.md`: agreed BT/phase recovery policy and planned routing improvements.
 - `docs/implementation_backlog.md`: active execution backlog, gates, and future real-robot hardening track.
-- `docs/ceo_project_brief.md`: executive-level project summary for stakeholder meetings.
+- `docs/project_brief.md`: executive-level project summary for stakeholder meetings.
 - `docs/meeting_deck_5_slides.md`: ready-to-present 5-slide markdown deck for management meetings.
 - `docs/system_concepts_and_layers.md`: full concept and layer-by-layer architecture explanation.
+- `docs/architecture_graphs_current_vs_hybrid.md`: side-by-side graph pack for current vs target ownership model.
+- `docs/bt_phase_architecture_draft.md`: design-lock draft for BT task-intent + phase-manager split.

@@ -189,6 +189,9 @@ REQUIRED_AI_ACTION_KEYS = {
 }
 
 OPTIONAL_AI_INFERENCE_KEYS = {
+    "align_pick_yaw_gate_enabled",
+    "align_pick_yaw_threshold_deg",
+    "align_pick_yaw_hold_steps",
     "use_world_place_goal_pose",
     "place_goal_world_xyz",
     "place_goal_world_yaw_deg",
@@ -201,6 +204,22 @@ OPTIONAL_AI_INFERENCE_KEYS = {
     "rxinfer_obs_noise_obj",
     "rxinfer_obs_noise_target",
     "rxinfer_min_variance",
+    "descend_watchdog_trigger_steps",
+    "descend_watchdog_hold_steps",
+    "descend_watchdog_misaligned_contact",
+    "place_cross_side_via_enabled",
+    "place_cross_side_x_gate",
+    "place_cross_side_via_y_offset",
+    "place_cross_side_via_x_bias",
+    "place_cross_side_via_z",
+    "place_cross_side_via_xy_threshold",
+    "place_keepout_enabled",
+    "place_keepout_center_x",
+    "place_keepout_center_y",
+    "place_keepout_radius",
+    "place_keepout_margin",
+    "place_keepout_push_gain",
+    "place_keepout_max_push",
 }
 
 AI_VECTOR_KEYS = {
@@ -227,6 +246,10 @@ AI_BOOL_KEYS = {
     "place_goal_yaw_pi_symmetric",
     "confidence_speed_scaling_enabled",
     "rxinfer_enabled",
+    "align_pick_yaw_gate_enabled",
+    "descend_watchdog_misaligned_contact",
+    "place_cross_side_via_enabled",
+    "place_keepout_enabled",
 }
 AI_INT_KEYS = {
     "align_max_steps",
@@ -234,6 +257,9 @@ AI_INT_KEYS = {
     "align_settle_steps",
     "descend_max_steps",
     "descend_stall_steps",
+    "descend_watchdog_trigger_steps",
+    "descend_watchdog_hold_steps",
+    "align_pick_yaw_hold_steps",
     "descend_timeout_extension_steps",
     "descend_max_timeout_extensions",
     "close_hold_steps",

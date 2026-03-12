@@ -199,6 +199,7 @@ def _select_action_python(current_belief, params=None):
     reach_z_blend_start = float(_require_param(params, "reach_z_blend_start"))
     reach_z_blend_full = float(_require_param(params, "reach_z_blend_full"))
     reach_step_min = float(_require_param(params, "reach_step_min"))
+    reach_yaw_align_xy_enter = float(params.get("reach_yaw_align_xy_enter", 0.02))
 
     reach_arc_enabled = bool(_require_param(params, "reach_arc_enabled"))
     reach_arc_max_theta_step_deg = float(_require_param(params, "reach_arc_max_theta_step_deg"))
@@ -210,6 +211,10 @@ def _select_action_python(current_belief, params=None):
     align_step = float(_require_param(params, "align_step"))
     align_threshold = float(_require_param(params, "align_threshold"))
     align_settle_step = float(_require_param(params, "align_settle_step"))
+    align_pick_yaw_gate_enabled = bool(params.get("align_pick_yaw_gate_enabled", True))
+    align_pick_yaw_threshold = float(
+        np.deg2rad(float(params.get("align_pick_yaw_threshold_deg", 10.0)))
+    )
     descend_x_threshold = float(_require_param(params, "descend_x_threshold"))
     descend_y_threshold = float(_require_param(params, "descend_y_threshold"))
     descend_z_threshold = float(_require_param(params, "descend_z_threshold"))
@@ -243,6 +248,21 @@ def _select_action_python(current_belief, params=None):
     place_goal_gripper_yaw_offset = float(
         np.deg2rad(float(_require_param(params, "place_goal_gripper_yaw_offset_deg")))
     )
+    place_cross_side_via_enabled = bool(params.get("place_cross_side_via_enabled", True))
+    place_cross_side_x_gate = float(params.get("place_cross_side_x_gate", 0.06))
+    place_cross_side_via_y_offset = float(params.get("place_cross_side_via_y_offset", 0.26))
+    place_cross_side_via_x_bias = float(params.get("place_cross_side_via_x_bias", 0.00))
+    place_cross_side_via_z = float(params.get("place_cross_side_via_z", 0.34))
+    place_cross_side_via_xy_threshold = float(
+        params.get("place_cross_side_via_xy_threshold", 0.06)
+    )
+    place_keepout_enabled = bool(params.get("place_keepout_enabled", True))
+    place_keepout_center_x = float(params.get("place_keepout_center_x", 0.0))
+    place_keepout_center_y = float(params.get("place_keepout_center_y", 0.0))
+    place_keepout_radius = float(params.get("place_keepout_radius", 0.18))
+    place_keepout_margin = float(params.get("place_keepout_margin", 0.08))
+    place_keepout_push_gain = float(params.get("place_keepout_push_gain", 0.03))
+    place_keepout_max_push = float(params.get("place_keepout_max_push", 0.018))
 
     cfg_reach_obj_rel = _require_vec3(params, "reach_obj_rel")
     cfg_align_obj_rel = _require_vec3(params, "align_obj_rel")
@@ -334,6 +354,58 @@ def _select_action_python(current_belief, params=None):
             "topdown_weight_scale": float(top),
             "nullspace_gain_scale": float(null),
         }
+
+    def _apply_place_keepout(move_vec, ee_world):
+        if not place_keepout_enabled:
+            return np.asarray(move_vec, dtype=float).reshape(3)
+        v = np.asarray(move_vec, dtype=float).reshape(3).copy()
+        center = np.asarray([place_keepout_center_x, place_keepout_center_y], dtype=float)
+        ee_xy = np.asarray(ee_world[:2], dtype=float).reshape(2)
+        rel = ee_xy - center
+        dist = float(np.linalg.norm(rel))
+        radius = max(1e-6, float(place_keepout_radius))
+        margin = max(1e-6, float(place_keepout_margin))
+        influence = radius + margin
+        no_entry = influence
+
+        if dist > 1e-9:
+            outward = rel / dist
+        else:
+            move_xy = np.asarray(v[:2], dtype=float)
+            move_n = float(np.linalg.norm(move_xy))
+            # If exactly at center, pick opposite to current XY move as outward.
+            if move_n > 1e-9:
+                outward = -move_xy / move_n
+            else:
+                outward = np.asarray([1.0, 0.0], dtype=float)
+
+        # While inside the influence shell, do not allow inward radial motion.
+        if dist < influence:
+            inward_component = -float(np.dot(v[:2], outward))
+            if inward_component > 0.0:
+                v[:2] = v[:2] + (inward_component * outward)
+            influence_scale = float(np.clip((influence - dist) / margin, 0.0, 1.0))
+            push = float(
+                np.clip(
+                    place_keepout_push_gain * max(0.35, influence_scale),
+                    0.0,
+                    max(0.0, float(place_keepout_max_push)),
+                )
+            )
+            v[:2] = v[:2] + (push * outward)
+
+        # Hard no-reentry projection: predicted next XY cannot be inside shell.
+        next_xy = ee_xy + np.asarray(v[:2], dtype=float)
+        next_rel = next_xy - center
+        next_dist = float(np.linalg.norm(next_rel))
+        if next_dist < no_entry:
+            if next_dist > 1e-9:
+                next_outward = next_rel / next_dist
+            else:
+                next_outward = outward
+            projected_xy = center + (next_outward * no_entry)
+            v[:2] = projected_xy - ee_xy
+        return v
 
     def _clip_move_to_step(move_vec, step_cap):
         v = np.asarray(move_vec, dtype=float).reshape(3)
@@ -580,15 +652,35 @@ def _select_action_python(current_belief, params=None):
             yaw_scale = 0.45
         else:
             yaw_scale = 0.75
+        orient_near_xy = float(max(0.02, reach_yaw_align_xy_enter))
+        orient_mid_xy = float(max(0.05, 1.8 * orient_near_xy))
+        if reach_xy_err > orient_mid_xy:
+            # Far from target XY: prioritize translational progress and avoid
+            # posture lock from early orientation constraints.
+            enable_yaw = False
+        elif reach_xy_err > orient_near_xy:
+            # Mid-range: keep orientation enabled but softened.
+            enable_yaw = True
+        else:
+            # Near target XY: full orientation guidance is helpful.
+            enable_yaw = True
         phase_scales = _phase_gain_scales("Reach")
         phase_scales = dict(phase_scales)
         phase_scales["yaw_weight_scale"] = float(
             min(yaw_scale, float(phase_scales.get("yaw_weight_scale", 1.0)))
         )
+        if reach_xy_err > orient_mid_xy:
+            phase_scales["topdown_weight_scale"] = float(
+                min(0.10, float(phase_scales.get("topdown_weight_scale", 1.0)))
+            )
+        elif reach_xy_err > orient_near_xy:
+            phase_scales["topdown_weight_scale"] = float(
+                min(0.70, float(phase_scales.get("topdown_weight_scale", 1.0)))
+            )
         return {
             "move": desired_move.tolist(),
             "grip": -1,
-            "enable_yaw_objective": True,
+            "enable_yaw_objective": bool(enable_yaw),
             "yaw_target": float(_object_yaw_target()),
             "yaw_pi_symmetric": True,
             "enable_topdown_objective": True,
@@ -599,6 +691,13 @@ def _select_action_python(current_belief, params=None):
         s_obj = np.array(current_belief.get("s_obj_mean", [0, 0, 0]), dtype=float)
         err = s_obj - align_obj_rel
         align_err = float(np.linalg.norm(err))
+        align_pick_yaw_error = float(current_belief.get("align_pick_yaw_error", 0.0))
+        yaw_gate_active = bool(align_pick_yaw_gate_enabled)
+        yaw_needs_settle = bool(
+            yaw_gate_active
+            and np.isfinite(align_pick_yaw_error)
+            and (abs(float(align_pick_yaw_error)) > float(max(0.0, align_pick_yaw_threshold)))
+        )
         desired = np.array([0.9 * err[0], 0.9 * err[1], 0.9 * err[2]], dtype=float)
         n = np.linalg.norm(desired)
         if n > align_step and n > 0:
@@ -606,44 +705,55 @@ def _select_action_python(current_belief, params=None):
         phase_scales = _phase_gain_scales("Align")
         phase_scales = dict(phase_scales)
         allow_orientation_only = False
-        # Merged align-settle behavior:
-        # keep a tiny corrective motion near threshold, then finish with orientation-only
-        # when already very close.
-        if align_err <= (0.5 * align_threshold):
+        # Yaw-first Align:
+        # while yaw gate is not satisfied, hold translation and finish yaw first.
+        if yaw_needs_settle:
             desired[:] = 0.0
             allow_orientation_only = True
-            phase_scales["position_gain_scale"] = 0.20
+            phase_scales["position_gain_scale"] = 0.05
             phase_scales["yaw_weight_scale"] = max(
-                1.35, float(phase_scales.get("yaw_weight_scale", 1.0))
+                2.00, float(phase_scales.get("yaw_weight_scale", 1.0))
             )
             phase_scales["topdown_weight_scale"] = max(
-                1.05, float(phase_scales.get("topdown_weight_scale", 1.0))
+                1.10, float(phase_scales.get("topdown_weight_scale", 1.0))
             )
-        elif align_err <= align_threshold:
-            desired = np.array([0.35 * err[0], 0.35 * err[1], 0.35 * err[2]], dtype=float)
-            n_hold = float(np.linalg.norm(desired))
-            settle_step = max(1e-6, float(align_settle_step))
-            if n_hold > settle_step and n_hold > 0:
-                desired = (desired / n_hold) * settle_step
-            phase_scales["position_gain_scale"] = min(
-                float(phase_scales.get("position_gain_scale", 1.0)),
-                0.70,
-            )
-            phase_scales["yaw_weight_scale"] = max(
-                float(phase_scales.get("yaw_weight_scale", 1.0)),
-                1.10,
-            )
-            phase_scales["topdown_weight_scale"] = max(
-                float(phase_scales.get("topdown_weight_scale", 1.0)),
-                1.10,
-            )
-        elif align_err <= (1.5 * align_threshold):
-            phase_scales["position_gain_scale"] = min(
-                0.70, float(phase_scales.get("position_gain_scale", 1.0))
-            )
-            phase_scales["yaw_weight_scale"] = max(
-                1.20, float(phase_scales.get("yaw_weight_scale", 1.0))
-            )
+        else:
+            # Once yaw is ready, finish precise translational alignment.
+            if align_err <= (0.5 * align_threshold):
+                desired[:] = 0.0
+                allow_orientation_only = True
+                phase_scales["position_gain_scale"] = 0.20
+                phase_scales["yaw_weight_scale"] = max(
+                    1.35, float(phase_scales.get("yaw_weight_scale", 1.0))
+                )
+                phase_scales["topdown_weight_scale"] = max(
+                    1.05, float(phase_scales.get("topdown_weight_scale", 1.0))
+                )
+            elif align_err <= align_threshold:
+                desired = np.array([0.35 * err[0], 0.35 * err[1], 0.35 * err[2]], dtype=float)
+                n_hold = float(np.linalg.norm(desired))
+                settle_step = max(1e-6, float(align_settle_step))
+                if n_hold > settle_step and n_hold > 0:
+                    desired = (desired / n_hold) * settle_step
+                phase_scales["position_gain_scale"] = min(
+                    float(phase_scales.get("position_gain_scale", 1.0)),
+                    0.70,
+                )
+                phase_scales["yaw_weight_scale"] = max(
+                    float(phase_scales.get("yaw_weight_scale", 1.0)),
+                    1.10,
+                )
+                phase_scales["topdown_weight_scale"] = max(
+                    float(phase_scales.get("topdown_weight_scale", 1.0)),
+                    1.10,
+                )
+            elif align_err <= (1.5 * align_threshold):
+                phase_scales["position_gain_scale"] = min(
+                    0.70, float(phase_scales.get("position_gain_scale", 1.0))
+                )
+                phase_scales["yaw_weight_scale"] = max(
+                    1.20, float(phase_scales.get("yaw_weight_scale", 1.0))
+                )
         # Keep gripper open while aligning.
         return {
             "move": desired.tolist(),
@@ -662,6 +772,8 @@ def _select_action_python(current_belief, params=None):
         abs_x = abs(float(err[0]))
         abs_y = abs(float(err[1]))
         abs_z = abs(float(err[2]))
+        descend_watchdog_active = bool(int(current_belief.get("descend_watchdog_active", 0)))
+        descend_misaligned_contact = bool(int(current_belief.get("descend_misaligned_contact", 0)))
 
         # "Threshold-left" control:
         # prioritize axes still outside threshold.
@@ -704,26 +816,58 @@ def _select_action_python(current_belief, params=None):
         n = np.linalg.norm(desired)
         descend_conf_scale = _phase_conf_scale(descend_confidence_speed_power)
         descend_step_cap = max(1e-6, grasp_step * descend_conf_scale)
-        if n > descend_step_cap and n > 0:
-            desired = (desired / n) * descend_step_cap
-        # Phase-local constrained EFE search:
-        # explore around nominal descend command and pick lowest EFE candidate
-        # while respecting XY-first gating.
-        desired = _select_local_efe_move(
-            phase_name="Descend",
-            nominal_move=desired,
-            err_vec=err,
-            step_cap=descend_step_cap,
-            grip_cmd=-1,
-            x_threshold=descend_x_threshold,
-            y_threshold=descend_y_threshold,
-            z_threshold=descend_z_threshold,
-            xy_first=True,
-            pred_ref_getter=lambda pred: (
-                np.asarray(pred.get("s_obj_mean", s_obj), dtype=float).reshape(3)
-                - descend_obj_rel
-            ),
-        )
+        if descend_watchdog_active:
+            # Reach-like fallback for descend: favor direct XY correction and
+            # temporarily disable exploratory local-EFE candidates that can
+            # reinforce wrong-way motion under contact/coupling.
+            if x_out and y_out:
+                w_x = max(0.75, x_ratio / (x_ratio + y_ratio + 1e-9))
+                w_y = max(0.75, y_ratio / (x_ratio + y_ratio + 1e-9))
+            elif x_out:
+                w_x = 1.0
+                w_y = 0.10
+            elif y_out:
+                w_x = 0.10
+                w_y = 1.0
+            else:
+                w_x = 0.25
+                w_y = 0.25
+
+            # While misaligned/contact, avoid further descend push and prioritize
+            # lateral correction toward threshold satisfaction.
+            if x_out or y_out or descend_misaligned_contact:
+                z_weight = 0.0
+            elif left_z > 0.0:
+                z_weight = 1.0
+            else:
+                z_weight = 0.0
+
+            desired = np.array([w_x * err[0], w_y * err[1], z_weight * err[2]], dtype=float)
+            watchdog_step_cap = max(descend_step_cap, min(0.03, 1.30 * grasp_step))
+            n = np.linalg.norm(desired)
+            if n > watchdog_step_cap and n > 0:
+                desired = (desired / n) * watchdog_step_cap
+        else:
+            if n > descend_step_cap and n > 0:
+                desired = (desired / n) * descend_step_cap
+            # Phase-local constrained EFE search:
+            # explore around nominal descend command and pick lowest EFE candidate
+            # while respecting XY-first gating.
+            desired = _select_local_efe_move(
+                phase_name="Descend",
+                nominal_move=desired,
+                err_vec=err,
+                step_cap=descend_step_cap,
+                grip_cmd=-1,
+                x_threshold=descend_x_threshold,
+                y_threshold=descend_y_threshold,
+                z_threshold=descend_z_threshold,
+                xy_first=True,
+                pred_ref_getter=lambda pred: (
+                    np.asarray(pred.get("s_obj_mean", s_obj), dtype=float).reshape(3)
+                    - descend_obj_rel
+                ),
+            )
         # Keep a weak yaw lock even while XY is still settling so orientation
         # does not drift badly, then ramp to full yaw control once XY gate is in.
         descend_yaw_enabled = bool(int(current_belief.get("descend_yaw_enabled", 0)))
@@ -742,6 +886,19 @@ def _select_action_python(current_belief, params=None):
             )
             phase_scales["nullspace_gain_scale"] = min(
                 phase_scales["nullspace_gain_scale"], 0.70
+            )
+        if descend_watchdog_active:
+            phase_scales["position_gain_scale"] = max(
+                phase_scales["position_gain_scale"], 1.00
+            )
+            phase_scales["yaw_weight_scale"] = min(
+                phase_scales["yaw_weight_scale"], 0.16
+            )
+            phase_scales["topdown_weight_scale"] = min(
+                phase_scales["topdown_weight_scale"], 0.55
+            )
+            phase_scales["nullspace_gain_scale"] = min(
+                phase_scales["nullspace_gain_scale"], 0.65
             )
         return {
             "move": desired.tolist(),
@@ -792,12 +949,46 @@ def _select_action_python(current_belief, params=None):
 
     if phase == "MoveToPlaceAbove":
         s_target = np.array(current_belief.get("s_target_mean", [0, 0, 0]), dtype=float)
+        s_ee = np.array(current_belief.get("s_ee_mean", [0, 0, 0]), dtype=float)
         preplace_target_rel = np.array(
             current_belief.get("preplace_target_rel", cfg_preplace_target_rel), dtype=float
         )
         # Defensive local fallback so this phase cannot fail from missing outer-scope binding.
         preplace_z_thr = float(params.get("preplace_z_threshold", preplace_xy_threshold))
+        preplace_step_cap = float(
+            max(0.010, min(reach_delta, 1.5 * max(preplace_xy_threshold, preplace_z_thr)))
+        )
         err = s_target - preplace_target_rel
+        goal_world = np.asarray(s_ee + err, dtype=float).reshape(3)
+        cross_side_signal = bool(
+            abs(float(s_ee[0])) >= float(place_cross_side_x_gate)
+            and abs(float(goal_world[0])) >= float(place_cross_side_x_gate)
+            and (float(s_ee[0]) * float(goal_world[0]) < 0.0)
+        )
+        cross_side_route_active = bool(int(current_belief.get("place_cross_side_route_active", 0)))
+        route_via = bool(place_cross_side_via_enabled and (cross_side_route_active or cross_side_signal))
+        route_err = np.asarray(err, dtype=float).copy()
+        via_world = None
+        if route_via:
+            via_y_sign = float(np.sign(goal_world[1]))
+            if abs(via_y_sign) < 1e-6:
+                via_y_sign = float(np.sign(s_ee[1]))
+            if abs(via_y_sign) < 1e-6:
+                via_y_sign = 1.0
+            via_world = np.asarray(
+                [
+                    float(place_cross_side_via_x_bias),
+                    float(via_y_sign * place_cross_side_via_y_offset),
+                    float(max(float(place_cross_side_via_z), float(s_ee[2]))),
+                ],
+                dtype=float,
+            )
+            via_err = np.asarray(via_world - s_ee, dtype=float)
+            via_xy_err = float(np.linalg.norm(via_err[:2]))
+            if via_xy_err > float(place_cross_side_via_xy_threshold):
+                route_err = via_err
+            else:
+                route_via = False
         yaw_target = float(_place_yaw_target() if place_goal_yaw_enabled else _object_yaw_target())
         yaw_pi = bool(place_goal_yaw_pi_symmetric if place_goal_yaw_enabled else True)
         place_yaw_error = abs(float(current_belief.get("place_goal_yaw_error", np.nan)))
@@ -828,7 +1019,7 @@ def _select_action_python(current_belief, params=None):
                 1.20, float(phase_scales.get("yaw_weight_scale", 1.0))
             )
             phase_scales["topdown_weight_scale"] = max(
-                1.00, float(phase_scales.get("topdown_weight_scale", 1.0))
+                1.20, float(phase_scales.get("topdown_weight_scale", 1.0))
             )
             return {
                 "move": [0.0, 0.0, 0.0],
@@ -841,31 +1032,93 @@ def _select_action_python(current_belief, params=None):
                 **phase_scales,
             }
         # XY-first approach to place-above: do not pull Z down while XY is still out.
-        xy_err = float(np.linalg.norm(err[:2]))
-        z_err = abs(float(err[2]))
-        z_weight = 0.0 if (xy_err > preplace_xy_threshold) else (1.0 if z_err > preplace_z_thr else 0.0)
-        desired = np.array([err[0], err[1], z_weight * err[2]], dtype=float)
+        xy_err = float(np.linalg.norm(route_err[:2]))
+        z_err = abs(float(route_err[2]))
+        preplace_xy_far = float(1.5 * preplace_xy_threshold)
+        if z_err <= preplace_z_thr:
+            z_weight = 0.0
+        elif xy_err >= preplace_xy_far:
+            z_weight = 0.0
+        elif xy_err <= preplace_xy_threshold:
+            z_weight = 1.0
+        else:
+            z_weight = float(
+                (preplace_xy_far - xy_err)
+                / max(1e-6, (preplace_xy_far - preplace_xy_threshold))
+            )
+        preplace_xy_first = bool(xy_err > preplace_xy_far)
+        desired = np.array([route_err[0], route_err[1], z_weight * route_err[2]], dtype=float)
+        # Place-side arc assist (non-breaking):
+        # for large/cross-side lateral transfers, prefer a curved XY move around
+        # base-centered geometry rather than pure straight-line XY.
+        if reach_arc_enabled and (xy_err > preplace_xy_far):
+            ee_xy = np.asarray(s_ee[:2], dtype=float)
+            goal_xy = np.asarray(s_ee[:2] + route_err[:2], dtype=float)
+            r_ee = float(np.linalg.norm(ee_xy))
+            r_goal = float(np.linalg.norm(goal_xy))
+            arc_radius_gate = max(0.05, float(reach_arc_min_radius))
+            if r_ee >= arc_radius_gate and r_goal >= arc_radius_gate:
+                theta_ee = float(np.arctan2(ee_xy[1], ee_xy[0]))
+                theta_goal = float(np.arctan2(goal_xy[1], goal_xy[0]))
+                dtheta_short = _wrap_to_pi(theta_goal - theta_ee)
+                cross_side = bool(float(ee_xy[0]) * float(goal_xy[0]) < 0.0)
+                arc_trigger = float(np.deg2rad(20.0))
+                if cross_side or abs(float(dtheta_short)) >= arc_trigger:
+                    max_theta_step = float(np.deg2rad(reach_arc_max_theta_step_deg))
+                    theta_step = float(np.sign(dtheta_short)) * min(
+                        max_theta_step, abs(float(dtheta_short))
+                    )
+                    theta_next = float(theta_ee + theta_step)
+                    r_next = float(
+                        r_ee
+                        + np.clip(
+                            r_goal - r_ee,
+                            -float(reach_arc_radial_step_max),
+                            float(reach_arc_radial_step_max),
+                        )
+                    )
+                    r_next = float(
+                        np.clip(
+                            r_next,
+                            float(reach_arc_min_radius),
+                            float(reach_arc_max_radius),
+                        )
+                    )
+                    arc_target_xy = np.array(
+                        [r_next * np.cos(theta_next), r_next * np.sin(theta_next)],
+                        dtype=float,
+                    )
+                    arc_xy = arc_target_xy - ee_xy
+                    direct_xy = np.asarray(route_err[:2], dtype=float)
+                    desired[:2] = (0.85 * arc_xy) + (0.15 * direct_xy)
         n = np.linalg.norm(desired)
-        if n > reach_delta and n > 0:
-            desired = (desired / n) * reach_delta
+        if n > preplace_step_cap and n > 0:
+            desired = (desired / n) * preplace_step_cap
+        desired = _apply_place_keepout(desired, s_ee)
         desired = _select_local_efe_move(
             phase_name="MoveToPlaceAbove",
             nominal_move=desired,
-            err_vec=err,
-            step_cap=reach_delta,
+            err_vec=route_err,
+            step_cap=preplace_step_cap,
             grip_cmd=1,
             x_threshold=preplace_xy_threshold,
             y_threshold=preplace_xy_threshold,
             z_threshold=preplace_z_thr,
             xy_norm_threshold=preplace_xy_threshold,
-            xy_first=True,
-            pred_ref_getter=lambda pred: (
-                np.asarray(pred.get("s_target_mean", s_target), dtype=float).reshape(3)
-                - preplace_target_rel
+            xy_first=preplace_xy_first,
+            pred_ref_getter=(
+                (lambda pred: (np.asarray(via_world, dtype=float) - np.asarray(pred.get("s_ee_mean", s_ee), dtype=float).reshape(3)))
+                if route_via and via_world is not None
+                else (lambda pred: (
+                    np.asarray(pred.get("s_target_mean", s_target), dtype=float).reshape(3)
+                    - preplace_target_rel
+                ))
             ),
         )
-        # Keep orientation active during preplace, but down-weight it while far.
-        orient_enable_xy = float(max(preplace_xy_threshold, 0.03))
+        desired = _apply_place_keepout(desired, s_ee)
+        desired = _clip_move_to_step(desired, preplace_step_cap)
+        # Keep orientation active during preplace and keep top-down strong.
+        orient_enable_xy = float(max(preplace_xy_far, 0.03))
         phase_scales = _phase_gain_scales("MoveToPlaceAbove")
         if xy_err > orient_enable_xy:
             phase_scales = dict(phase_scales)
@@ -874,16 +1127,16 @@ def _select_action_python(current_belief, params=None):
             phase_scales["yaw_weight_scale"] = float(
                 min(0.40, phase_scales.get("yaw_weight_scale", 1.0))
             )
-            # Keep top-down objective enabled, but soften it while far so
-            # translation dominates and preplace does not stall.
-            phase_scales["topdown_weight_scale"] = float(min(0.65, phase_scales.get("topdown_weight_scale", 1.0)))
+            phase_scales["topdown_weight_scale"] = float(
+                max(1.20, phase_scales.get("topdown_weight_scale", 1.0))
+            )
         elif xy_err > preplace_xy_threshold:
             phase_scales = dict(phase_scales)
             phase_scales["yaw_weight_scale"] = float(
                 min(0.70, phase_scales.get("yaw_weight_scale", 1.0))
             )
             phase_scales["topdown_weight_scale"] = float(
-                min(0.85, phase_scales.get("topdown_weight_scale", 1.0))
+                max(1.10, phase_scales.get("topdown_weight_scale", 1.0))
             )
         return {
             "move": desired.tolist(),
@@ -897,35 +1150,79 @@ def _select_action_python(current_belief, params=None):
 
     if phase == "DescendToPlace":
         s_target = np.array(current_belief.get("s_target_mean", [0, 0, 0]), dtype=float)
+        s_ee = np.array(current_belief.get("s_ee_mean", [0, 0, 0]), dtype=float)
         place_target_rel = np.array(
             current_belief.get("place_target_rel", cfg_place_target_rel), dtype=float
         )
         err = s_target - place_target_rel
         xy_err = float(np.linalg.norm(err[:2]))
         z_err = abs(float(err[2]))
-        z_weight = 0.0 if (xy_err > place_xy_threshold) else (1.0 if z_err > place_z_threshold else 0.0)
+        place_step_cap = float(
+            max(0.006, min(grasp_step, 0.9 * max(place_xy_threshold, place_z_threshold)))
+        )
+        place_xy_far = float(1.8 * place_xy_threshold)
+        if z_err <= place_z_threshold:
+            z_weight = 0.0
+        elif xy_err >= place_xy_far:
+            z_weight = 0.0
+        elif xy_err <= place_xy_threshold:
+            z_weight = 1.0
+        else:
+            z_weight = float(
+                (place_xy_far - xy_err)
+                / max(1e-6, (place_xy_far - place_xy_threshold))
+            )
+        place_xy_first = bool(xy_err > place_xy_far)
         desired = np.array([err[0], err[1], z_weight * err[2]], dtype=float)
         n = np.linalg.norm(desired)
-        if n > grasp_step and n > 0:
-            desired = (desired / n) * grasp_step
+        if n > place_step_cap and n > 0:
+            desired = (desired / n) * place_step_cap
         desired = _select_local_efe_move(
             phase_name="DescendToPlace",
             nominal_move=desired,
             err_vec=err,
-            step_cap=grasp_step,
+            step_cap=place_step_cap,
             grip_cmd=1,
             x_threshold=place_xy_threshold,
             y_threshold=place_xy_threshold,
             z_threshold=place_z_threshold,
             xy_norm_threshold=place_xy_threshold,
-            xy_first=True,
+            xy_first=place_xy_first,
             pred_ref_getter=lambda pred: (
                 np.asarray(pred.get("s_target_mean", s_target), dtype=float).reshape(3)
                 - place_target_rel
             ),
         )
+        desired = _apply_place_keepout(desired, s_ee)
+        desired = _clip_move_to_step(desired, place_step_cap)
         yaw_target = float(_place_yaw_target() if place_goal_yaw_enabled else _object_yaw_target())
         yaw_pi = bool(place_goal_yaw_pi_symmetric if place_goal_yaw_enabled else True)
+        phase_scales = _phase_gain_scales("DescendToPlace")
+        if xy_err > place_xy_far:
+            phase_scales = dict(phase_scales)
+            phase_scales["position_gain_scale"] = float(
+                max(0.95, phase_scales.get("position_gain_scale", 1.0))
+            )
+            phase_scales["nullspace_gain_scale"] = float(
+                max(0.95, phase_scales.get("nullspace_gain_scale", 1.0))
+            )
+            phase_scales["yaw_weight_scale"] = float(
+                min(0.45, phase_scales.get("yaw_weight_scale", 1.0))
+            )
+            phase_scales["topdown_weight_scale"] = float(
+                min(0.65, phase_scales.get("topdown_weight_scale", 1.0))
+            )
+        elif xy_err > place_xy_threshold:
+            phase_scales = dict(phase_scales)
+            phase_scales["position_gain_scale"] = float(
+                max(0.80, phase_scales.get("position_gain_scale", 1.0))
+            )
+            phase_scales["yaw_weight_scale"] = float(
+                min(0.75, phase_scales.get("yaw_weight_scale", 1.0))
+            )
+            phase_scales["topdown_weight_scale"] = float(
+                min(0.85, phase_scales.get("topdown_weight_scale", 1.0))
+            )
         return {
             "move": desired.tolist(),
             "grip": 1,
@@ -933,7 +1230,7 @@ def _select_action_python(current_belief, params=None):
             "yaw_target": yaw_target,
             "yaw_pi_symmetric": yaw_pi,
             "enable_topdown_objective": True,
-            **_phase_gain_scales("DescendToPlace"),
+            **phase_scales,
         }
 
     if phase == "Open":

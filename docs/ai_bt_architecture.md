@@ -1,6 +1,6 @@
 # Active-Inference + BT Architecture
 
-Last updated: 2026-03-04
+Last updated: 2026-03-12
 
 ## Goal
 Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the low-level action policy for pick-and-place.
@@ -14,6 +14,37 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
 - Root: `Selector`
 - Child 1: `Sequence(Acquire, Place)`
 - Child 2: `Recover`
+
+### Task-Intent and Routing Observability (Current)
+- Runtime now emits BT task decision telemetry without changing legacy phase-transition behavior:
+  - `task_intent` (`PICK`, `PLACE`, `RECOVER`, `DONE`, `FAILURE`)
+  - `bt_decision` (`CONTINUE`, `RECOVER`, `TASK_SWITCH`, `SUCCESS`, `TERMINAL_FAILURE`)
+  - `task_route_source` (how task intent was chosen)
+  - `phase_owner` (current phase manager owner label)
+  - `phase_event`, `phase_event_class`, `task_switch_event`
+- Non-breaking router/manager scaffolding is present:
+  - `agent/phase_router.py`
+  - `agent/phase_managers.py`
+- Full phase transitions are still primarily in `inference_interface.py` for now.
+
+### Implemented In This Release (2026-03-12)
+- Place-side drop routing is explicit and observable:
+  - `phase_event=object_dropped`
+  - `task_switch_event=object_dropped`
+  - BT emits `bt_decision=TASK_SWITCH`
+  - runtime routes back to `Reach` (pick entry)
+- BT task-switch now resets retry budget on `object_dropped` (`retry_count=0`) before re-pick cycle.
+- Align yaw gate before descend is active:
+  - `align_pick_yaw_gate_enabled`
+  - `align_pick_yaw_threshold_deg`
+  - `align_pick_yaw_hold_steps`
+- `o_ee_yaw` signal is added and aligned to controller yaw definition (EE-site axis + controller `yaw_axis`).
+- Reach orientation behavior is translation-first when far (reduced/disabled yaw objective), with final yaw-align hold preserved near transition.
+- Place keepout logic now enforces no-reentry projection and applies keepout correction after local action search.
+- `MoveToPlaceAbove` topdown weighting is intentionally stronger in this release.
+- CSV observability was extended with:
+  - `ai_belief_ee_yaw`
+  - `ai_align_pick_yaw_error`
 
 ### BT Node Meaning
 - `Acquire`: object acquisition pipeline is running or finished.
@@ -48,6 +79,8 @@ Use a Behavior Tree (BT) as a high-level supervisor and active-inference as the 
 - On BT recovery request:
   - phase is reset to `Reach` for pick-side failures
   - place-side alignment failures can re-enter `MoveToPlaceAbove` when grasp is still retained
+  - place-side `object_dropped` semantic event triggers BT task switch intent to `PICK` and re-enters pick at `Reach`
+  - retry budget is reset on this explicit task-switch path (`retry_count=0`)
   - key timers/counters are reset
   - cooldown is applied
   - retry count increments

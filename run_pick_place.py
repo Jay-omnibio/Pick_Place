@@ -183,6 +183,9 @@ def main():
         sensor_config = yaml.safe_load(f)
     with open(SAFETY_CONFIG_PATH, "r") as f:
         safety_config = yaml.safe_load(f)
+    # Keep sensed EE yaw definition aligned with controller yaw-axis definition.
+    sensor_config.setdefault("ee_sensor", {})
+    sensor_config["ee_sensor"]["yaw_axis"] = int(runtime_cfg["controller_cfg"]["yaw_axis"])
 
     sensor_backend = SimSensorBackend(config_path=SENSOR_CONFIG_PATH, config=sensor_config)
     safety_checker = SafetyChecker(safety_config)

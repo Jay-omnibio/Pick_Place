@@ -1,0 +1,30 @@
+flowchart LR
+  subgraph L1[Layer 1 - BT Supervisor (current)]
+    BT[BT Tick]
+    BTR[Recover Belief]
+  end
+
+  subgraph L2[Layer 2 - Unified Phase Machine (current)]
+    R[Reach] --> A[Align] --> D[Descend] --> CH[CloseHold] --> LT[LiftTest]
+    LT --> T[Transit] --> MPA[MoveToPlaceAbove] --> DTP[DescendToPlace] --> O[Open] --> RT[Retreat] --> DN[Done]
+  end
+
+  subgraph L3[Layer 3 - Active Inference]
+    IB[infer_beliefs]
+    SA[select_action]
+  end
+
+  subgraph L4[Layer 4 - Control]
+    CTRL[Controller + Safety]
+  end
+
+  subgraph L5[Layer 5 - Plant]
+    SIM[Robot/Simulator]
+    OBS[Sensor Observation]
+  end
+
+  OBS --> IB --> BT
+  BT -->|normal| SA
+  BT -->|recover| BTR --> SA
+  SA --> CTRL --> SIM --> OBS
+

@@ -12,6 +12,8 @@ import numpy as np
 from inference_interface import infer_beliefs
 from inference.action_selection import select_action
 from agent.ai_behavior_tree import AIPickPlaceBehaviorTree
+from agent.phase_router import PhaseRouter
+from agent.phase_managers import manager_name_from_phase
 
 
 class ActiveInferenceAgent:
@@ -110,6 +112,17 @@ class ActiveInferenceAgent:
             safe_backoff_hold_steps=int(self.active_inference_params.get("bt_safe_backoff_hold_steps", 30)),
             safe_backoff_z_boost=float(self.active_inference_params.get("bt_safe_backoff_z_boost", 0.02)),
         )
+        self.phase_router = PhaseRouter()
+        self.ai_bt_task_intent = "PICK"
+        self.ai_bt_decision = "CONTINUE"
+        self.ai_task_route_source = "startup"
+        self.ai_phase_owner = manager_name_from_phase("Reach")
+        self.retry_scope_event_counts = {
+            "PHASE_RETRY": 0,
+            "BT_RECOVERY": 0,
+            "BT_TASK_SWITCH": 0,
+        }
+        self._retry_summary_printed = False
         self.ai_risk_detection_enabled = bool(
             self.active_inference_params.get("risk_detection_enabled", False)
         )
@@ -162,6 +175,7 @@ class ActiveInferenceAgent:
         self.prev_ai_release_warning = 0
         self.prev_ai_singularity_warn = 0
         self.prev_ai_unintended_contact_warn = 0
+        self.prev_ai_retry_reason = ""
         self.prev_ctrl_xy_wrong_way = 0
         self.prev_ctrl_xy_guard_applied = 0
         self.log_contact_events = self._env_flag("LOG_CONTACT_EVENTS", False)
@@ -260,6 +274,8 @@ class ActiveInferenceAgent:
             "ai_belief_target_rel_y",
             "ai_belief_target_rel_z",
             "ai_belief_obj_yaw",
+            "ai_belief_ee_yaw",
+            "ai_align_pick_yaw_error",
             "action_move_x",
             "action_move_y",
             "action_move_z",
@@ -292,9 +308,18 @@ class ActiveInferenceAgent:
             "ai_phase_conf_ok",
             "ai_phase_vfe_ok",
             "ai_phase_gate_ok",
+            "ai_task_intent",
+            "ai_bt_decision",
+            "ai_task_route_source",
+            "ai_phase_owner",
+            "ai_phase_event",
+            "ai_phase_event_class",
+            "ai_task_switch_event",
+            "ai_requested_task_intent",
             "ai_bt_status",
             "ai_bt_reason",
             "ai_retry_reason",
+            "ai_retry_scope",
             "ai_failure_reason",
             "ai_recovery_branch",
             "ai_recovery_branch_retry",
@@ -961,7 +986,25 @@ class ActiveInferenceAgent:
             d_desc_x = float(m["true_descend_x_error"] - prev_hb["true_descend_x_error"])
             d_desc_y = float(m["true_descend_y_error"] - prev_hb["true_descend_y_error"])
             d_desc_z = float(m["true_descend_z_error"] - prev_hb["true_descend_z_error"])
-        msg = f"[HB] step={self.step_count} phase={phase} contact={contact} grip={grip_cmd}"
+        task_intent = (
+            str(self.current_belief.get("task_intent", self.ai_bt_task_intent))
+            if self.current_belief is not None
+            else str(self.ai_bt_task_intent)
+        )
+        bt_decision = (
+            str(self.current_belief.get("bt_decision", self.ai_bt_decision))
+            if self.current_belief is not None
+            else str(self.ai_bt_decision)
+        )
+        task_route_source = (
+            str(self.current_belief.get("task_route_source", self.ai_task_route_source))
+            if self.current_belief is not None
+            else str(self.ai_task_route_source)
+        )
+        msg = (
+            f"[HB] step={self.step_count} phase={phase} task={task_intent} "
+            f"bt_decision={bt_decision} route={task_route_source} contact={contact} grip={grip_cmd}"
+        )
         msg += (
             f" obs_age={self.obs_age_ms:.1f}ms stale={self.obs_stale_warn} "
             f"loop={self.loop_dt_ms:.1f}ms jit={self.loop_jitter_ms:.1f}ms "
@@ -1118,6 +1161,9 @@ class ActiveInferenceAgent:
             msg += f" conf={conf:.2f}"
             msg += f" vfe={vfe:.3f}"
             msg += f" gate={conf_ok}:{vfe_ok}"
+            phase_event = str(self.current_belief.get("phase_event", "")).strip()
+            if phase_event:
+                msg += f" event={phase_event}"
             msg += f" belief={belief_backend}"
             msg += f" overrun={self.loop_overrun_count}"
             release_warn = int(self.current_belief.get("release_warning", 0))
@@ -1314,16 +1360,39 @@ class ActiveInferenceAgent:
             row["ai_belief_target_rel_y"] = float(b_tgt[1])
             row["ai_belief_target_rel_z"] = float(b_tgt[2])
             row["ai_belief_obj_yaw"] = float(self.current_belief.get("s_obj_yaw", np.nan))
+            row["ai_belief_ee_yaw"] = float(self.current_belief.get("s_ee_yaw", np.nan))
+            row["ai_align_pick_yaw_error"] = float(
+                self.current_belief.get("align_pick_yaw_error", np.nan)
+            )
             row["ai_obs_confidence"] = float(self.current_belief.get("obs_confidence", 1.0))
             row["ai_vfe_total"] = float(self.current_belief.get("vfe_total", 0.0))
             row["ai_phase_conf_ok"] = int(self.current_belief.get("phase_conf_ok", 1))
             row["ai_phase_vfe_ok"] = int(self.current_belief.get("phase_vfe_ok", 1))
             row["ai_phase_gate_ok"] = int(self.current_belief.get("phase_gate_ok", 1))
+            row["ai_task_intent"] = str(
+                self.current_belief.get("task_intent", self.ai_bt_task_intent)
+            )
+            row["ai_bt_decision"] = str(
+                self.current_belief.get("bt_decision", self.ai_bt_decision)
+            )
+            row["ai_task_route_source"] = str(
+                self.current_belief.get("task_route_source", self.ai_task_route_source)
+            )
+            row["ai_phase_owner"] = str(
+                self.current_belief.get("phase_owner", self.ai_phase_owner)
+            )
+            row["ai_phase_event"] = str(self.current_belief.get("phase_event", ""))
+            row["ai_phase_event_class"] = str(self.current_belief.get("phase_event_class", ""))
+            row["ai_task_switch_event"] = str(self.current_belief.get("task_switch_event", ""))
+            row["ai_requested_task_intent"] = str(
+                self.current_belief.get("requested_task_intent", "")
+            )
             row["ai_bt_status"] = (
                 self.ai_bt.status.value if (self.ai_bt is not None and self.ai_bt.status is not None) else ""
             )
             row["ai_bt_reason"] = self.ai_bt.last_reason if self.ai_bt is not None else ""
             row["ai_retry_reason"] = str(self.current_belief.get("last_retry_reason", ""))
+            row["ai_retry_scope"] = str(self.current_belief.get("retry_scope", ""))
             row["ai_failure_reason"] = str(self.current_belief.get("failure_reason", ""))
             row["ai_recovery_branch"] = str(self.current_belief.get("recovery_branch", ""))
             row["ai_recovery_branch_retry"] = int(self.current_belief.get("recovery_branch_retry", 0))
@@ -1346,14 +1415,25 @@ class ActiveInferenceAgent:
             row["ai_belief_target_rel_y"] = ""
             row["ai_belief_target_rel_z"] = ""
             row["ai_belief_obj_yaw"] = ""
+            row["ai_belief_ee_yaw"] = ""
+            row["ai_align_pick_yaw_error"] = ""
             row["ai_obs_confidence"] = ""
             row["ai_vfe_total"] = ""
             row["ai_phase_conf_ok"] = ""
             row["ai_phase_vfe_ok"] = ""
             row["ai_phase_gate_ok"] = ""
+            row["ai_task_intent"] = str(self.ai_bt_task_intent)
+            row["ai_bt_decision"] = str(self.ai_bt_decision)
+            row["ai_task_route_source"] = str(self.ai_task_route_source)
+            row["ai_phase_owner"] = str(self.ai_phase_owner)
+            row["ai_phase_event"] = ""
+            row["ai_phase_event_class"] = ""
+            row["ai_task_switch_event"] = ""
+            row["ai_requested_task_intent"] = ""
             row["ai_bt_status"] = ""
             row["ai_bt_reason"] = ""
             row["ai_retry_reason"] = ""
+            row["ai_retry_scope"] = ""
             row["ai_failure_reason"] = ""
             row["ai_recovery_branch"] = ""
             row["ai_recovery_branch_retry"] = ""
@@ -1373,6 +1453,13 @@ class ActiveInferenceAgent:
             row["true_hand_roll"] = 0.0
             row["true_hand_pitch"] = 0.0
             row["true_hand_yaw"] = 0.0
+
+        retry_scope = str(row.get("ai_retry_scope", "")).strip()
+        if retry_scope:
+            if retry_scope not in self.retry_scope_event_counts:
+                self.retry_scope_event_counts[retry_scope] = 0
+            self.retry_scope_event_counts[retry_scope] += 1
+
         self._csv_writer.writerow(row)
         if self.step_count % 50 == 0:
             self._csv_file.flush()
@@ -1461,6 +1548,11 @@ class ActiveInferenceAgent:
             if not self._ai_settle_logged:
                 print(f"[AI] startup_settle_steps={self.ai_startup_settle_steps} (holding EE while object settles)")
                 self._ai_settle_logged = True
+            self.ai_bt_task_intent = "PICK"
+            self.ai_bt_decision = "CONTINUE"
+            self.ai_task_route_source = "startup"
+            self.ai_phase_owner = manager_name_from_phase("Reach")
+            self.prev_ai_retry_reason = ""
             action = {
                 "move": [0.0, 0.0, 0.0],
                 "grip": -1,
@@ -1474,6 +1566,11 @@ class ActiveInferenceAgent:
                 previous_belief=self.current_belief,
                 params=self.active_inference_params,
             )
+            self.ai_bt_decision = "CONTINUE"
+            if self.ai_bt is not None:
+                self.ai_bt_task_intent = self.ai_bt.task_intent_for_phase(
+                    str(self.current_belief.get("phase", "Reach"))
+                )
             self._update_ai_risk_detection(observation)
             # Expose monitor signals to BT so recovery can use standard reason taxonomy.
             if self.current_belief is not None:
@@ -1486,8 +1583,17 @@ class ActiveInferenceAgent:
                 )
             if self.ai_bt is not None:
                 bt_result = self.ai_bt.tick(self.current_belief)
+                self.ai_bt_task_intent = str(
+                    bt_result.get("task_intent", self.ai_bt_task_intent)
+                )
+                self.ai_bt_decision = str(
+                    bt_result.get("bt_decision", self.ai_bt_decision)
+                )
                 if bt_result.get("recover", False):
                     self.current_belief = self.ai_bt.recover_belief(self.current_belief)
+                    self.ai_bt_task_intent = self.ai_bt.task_intent_for_phase(
+                        str(self.current_belief.get("phase", "Reach"))
+                    )
                     branch = str(self.current_belief.get("recovery_branch", ""))
                     branch_retry = int(self.current_belief.get("recovery_branch_retry", 0))
                     global_count = int(self.current_belief.get("recovery_global_count", 0))
@@ -1498,6 +1604,33 @@ class ActiveInferenceAgent:
                         f"global={global_count} "
                         f"retry={int(self.current_belief.get('retry_count', 0))}"
                     )
+                if self.current_belief is not None:
+                    route_decision = self.phase_router.resolve_task_intent(
+                        self.ai_bt_task_intent, self.current_belief
+                    )
+                    self.ai_bt_task_intent = str(route_decision.task_intent)
+                    self.ai_task_route_source = str(route_decision.route_source)
+                    self.ai_phase_owner = manager_name_from_phase(
+                        str(self.current_belief.get("phase", "Reach"))
+                    )
+                    self.current_belief["task_intent"] = str(self.ai_bt_task_intent)
+                    self.current_belief["bt_decision"] = str(self.ai_bt_decision)
+                    self.current_belief["task_route_source"] = str(self.ai_task_route_source)
+                    self.current_belief["phase_owner"] = str(self.ai_phase_owner)
+                    retry_reason = str(self.current_belief.get("last_retry_reason", "")).strip()
+                    prev_retry_reason = str(self.prev_ai_retry_reason).strip()
+                    is_new_retry_event = bool(retry_reason) and (retry_reason != prev_retry_reason)
+                    if is_new_retry_event:
+                        if self.ai_bt_decision == "TASK_SWITCH":
+                            retry_scope = "BT_TASK_SWITCH"
+                        elif self.ai_bt_decision == "RECOVER":
+                            retry_scope = "BT_RECOVERY"
+                        else:
+                            retry_scope = "PHASE_RETRY"
+                    else:
+                        retry_scope = ""
+                    self.current_belief["retry_scope"] = retry_scope
+                    self.prev_ai_retry_reason = retry_reason
             action = select_action(self.current_belief, params=self.active_inference_params)
         action = self._maybe_escape_stall(action, sim_state)
         self.action_history.append(action)
@@ -1523,6 +1656,18 @@ class ActiveInferenceAgent:
         if hasattr(self, "_csv_file") and self._csv_file and not self._csv_file.closed:
             self._csv_file.flush()
             self._csv_file.close()
+        if not self._retry_summary_printed:
+            phase_retry = int(self.retry_scope_event_counts.get("PHASE_RETRY", 0))
+            bt_recovery = int(self.retry_scope_event_counts.get("BT_RECOVERY", 0))
+            bt_task_switch = int(self.retry_scope_event_counts.get("BT_TASK_SWITCH", 0))
+            total = int(sum(int(v) for v in self.retry_scope_event_counts.values()))
+            print(
+                f"[Summary-Retry] total={total} "
+                f"phase_retry={phase_retry} "
+                f"bt_recovery={bt_recovery} "
+                f"bt_task_switch={bt_task_switch}"
+            )
+            self._retry_summary_printed = True
 
     def _maybe_pause_for_inspection(self, sim_state, observation):
         if not self.pause_pending:

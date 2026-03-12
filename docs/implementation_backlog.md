@@ -24,6 +24,12 @@ Consolidated note:
 12. Pick-side hold-stage cleanup completed:
  - separate `PreGraspHold` phase removed
  - merged `Align` settle gate in place (`align_settle_steps`, `align_settle_step`)
+13. Align yaw gate before descend implemented (`align_pick_yaw_*` keys).
+14. Place-side `object_dropped` task-switch routing implemented with explicit BT observability fields.
+15. Retry budget reset on `object_dropped` task switch (`retry_count=0`).
+16. EE yaw observation (`o_ee_yaw`) aligned to controller yaw axis semantics.
+17. Place keepout no-reentry projection is active (post-selection correction included).
+18. Reach orientation policy now translation-first when far, with final yaw-align hold preserved near transition.
 
 ## Reverted Experiments (For Future Re-Test)
 These were tested and then reverted. Keep as reference so they can be re-applied later in a controlled A/B run.

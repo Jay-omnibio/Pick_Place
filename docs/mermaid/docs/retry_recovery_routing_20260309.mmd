@@ -1,0 +1,19 @@
+flowchart TD
+  DTP[DescendToPlace timeout]
+  OTO[Open timeout]
+  GL[Grasp lost in place-side]
+  BTREC[BT recover trigger]
+
+  DTP -->|s_grasp=1 and budget left| MPA1[MoveToPlaceAbove]
+  DTP -->|s_grasp=1 and budget exceeded| FAIL1[Failure]
+  DTP -->|s_grasp=0| REACH1[Reach]
+
+  OTO -->|release_failed and budget left| MPA2[MoveToPlaceAbove]
+  OTO -->|budget exceeded| FAIL2[Failure]
+
+  GL --> REACH2[Reach]
+
+  BTREC -->|reason=place_alignment_failed/release_failed and grasp held| MPA3[MoveToPlaceAbove]
+  BTREC -->|other reasons| REACH3[Reach]
+  BTREC -->|retry caps exceeded| FAIL3[Failure]
+

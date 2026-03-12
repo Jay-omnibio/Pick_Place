@@ -258,6 +258,30 @@ def _compute_phase_vfe(
     return vfe_total, vfe_pragmatic, vfe_epistemic
 
 
+def _task_intent_from_phase_name(phase: str) -> str:
+    p = str(phase or "Reach")
+    if p in ("Reach", "Align", "Descend", "CloseHold", "LiftTest"):
+        return "PICK"
+    if p in ("Transit", "MoveToPlaceAbove", "DescendToPlace", "Open", "Retreat"):
+        return "PLACE"
+    if p == "Done":
+        return "DONE"
+    if p == "Failure":
+        return "FAILURE"
+    return "PICK"
+
+
+def _event_class_from_reason(reason: str) -> str:
+    r = str(reason or "").strip()
+    if not r:
+        return ""
+    if r in ("reach_stall", "place_alignment_failed", "release_failed"):
+        return "semantic_repeat"
+    if r == "grasp_failed":
+        return "task_switch"
+    return "local_transient"
+
+
 def infer_beliefs(observation, previous_belief=None, params=None):
     """
     Perform one inference step.
@@ -299,6 +323,17 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     descend_stall_steps = int(_require_param(params, "descend_stall_steps"))
     descend_timeout_extension_steps = int(_require_param(params, "descend_timeout_extension_steps"))
     descend_max_timeout_extensions = int(_require_param(params, "descend_max_timeout_extensions"))
+    # Optional descend watchdog controls (kept non-breaking via defaults).
+    descend_watchdog_trigger_steps = int(
+        params.get(
+            "descend_watchdog_trigger_steps",
+            max(40, int(0.35 * max(1, int(descend_stall_steps)))),
+        )
+    )
+    descend_watchdog_hold_steps = int(params.get("descend_watchdog_hold_steps", 60))
+    descend_watchdog_misaligned_contact = bool(
+        params.get("descend_watchdog_misaligned_contact", True)
+    )
 
     close_hold_steps = int(_require_param(params, "close_hold_steps"))
     grasp_search_steps = int(_require_param(params, "grasp_search_steps"))
@@ -352,6 +387,11 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     reach_stall_steps = int(_require_param(params, "reach_stall_steps"))
     reach_yaw_align_xy_enter = float(_require_param(params, "reach_yaw_align_xy_enter"))
     reach_yaw_align_steps = int(_require_param(params, "reach_yaw_align_steps"))
+    align_pick_yaw_gate_enabled = bool(params.get("align_pick_yaw_gate_enabled", True))
+    align_pick_yaw_threshold = float(
+        np.deg2rad(float(params.get("align_pick_yaw_threshold_deg", 10.0)))
+    )
+    align_pick_yaw_hold_steps = max(1, int(params.get("align_pick_yaw_hold_steps", 6)))
     grip_close_ready_max_width = float(_require_param(params, "grip_close_ready_max_width"))
     preplace_target_rel = _require_vec3(params, "preplace_target_rel")
     place_target_rel = _require_vec3(params, "place_target_rel")
@@ -390,6 +430,8 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     preplace_max_timeout_extensions = int(_require_param(params, "preplace_max_timeout_extensions"))
     preplace_timeout_xy_threshold = float(_require_param(params, "preplace_timeout_xy_threshold"))
     preplace_timeout_z_threshold = float(_require_param(params, "preplace_timeout_z_threshold"))
+    place_cross_side_via_enabled = bool(params.get("place_cross_side_via_enabled", True))
+    place_cross_side_x_gate = float(params.get("place_cross_side_x_gate", 0.06))
     place_xy_threshold = float(_require_param(params, "place_xy_threshold"))
     place_z_threshold = float(_require_param(params, "place_z_threshold"))
     place_descend_max_steps = int(_require_param(params, "place_descend_max_steps"))
@@ -436,6 +478,23 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         init_obj_yaw = float(observation.get("o_obj_yaw", 0.0))
         if not np.isfinite(init_obj_yaw):
             init_obj_yaw = 0.0
+        init_ee_yaw = float(observation.get("o_ee_yaw", 0.0))
+        if not np.isfinite(init_ee_yaw):
+            init_ee_yaw = 0.0
+        init_pick_yaw_target = _wrap_to_pi(float(init_obj_yaw) + 0.5 * np.pi)
+        init_align_pick_yaw_error = float(
+            abs(
+                _yaw_error(
+                    current_yaw=init_ee_yaw,
+                    desired_yaw=init_pick_yaw_target,
+                    pi_symmetric=True,
+                )
+            )
+        )
+        init_align_yaw_ok_counter = int(
+            (not align_pick_yaw_gate_enabled)
+            or (init_align_pick_yaw_error <= max(0.0, align_pick_yaw_threshold))
+        )
         init_approach_side_sign = _compute_approach_side_sign(
             s_ee_mean=init_s_ee_mean,
             s_obj_mean=init_s_obj_mean,
@@ -478,6 +537,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "s_obj_cov": init_s_obj_cov,
             "s_target_cov": init_s_target_cov,
             "s_obj_yaw": init_obj_yaw,
+            "s_ee_yaw": init_ee_yaw,
             "reach_obj_rel_local": reach_obj_rel_local_cfg.copy(),
             "align_obj_rel_local": align_obj_rel_local_cfg.copy(),
             "descend_obj_rel_local": descend_obj_rel_local_cfg.copy(),
@@ -485,6 +545,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "reach_obj_rel": reach_obj_rel.copy(),
             "align_obj_rel": align_obj_rel.copy(),
             "descend_obj_rel": descend_obj_rel.copy(),
+            "align_pick_yaw_error": float(init_align_pick_yaw_error),
             "preplace_target_rel": preplace_target_rel.copy(),
             "place_target_rel": place_target_rel.copy(),
             "use_world_place_goal_pose": int(use_world_place_goal_pose),
@@ -529,6 +590,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "align_gate_active": 0,
             "align_gate_counter": 0,
             "align_settle_counter": 0,
+            "align_yaw_ok_counter": int(init_align_yaw_ok_counter),
             "descend_gate_active": 0,
             "descend_gate_counter": 0,
             "descend_yaw_enabled": 0,
@@ -550,6 +612,9 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "descend_best_error": float("inf"),
             "descend_no_progress_steps": 0,
             "descend_timeout_extensions": 0,
+            "descend_watchdog_active": 0,
+            "descend_watchdog_timer": 0,
+            "descend_misaligned_contact": 0,
             "close_hold_timer": 0,
             "lift_test_timer": 0,
             "lift_test_ref_obj_rel": observation["o_obj"].copy(),
@@ -571,6 +636,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "preplace_best_error": float("inf"),
             "preplace_no_progress_steps": 0,
             "preplace_timeout_extensions": 0,
+            "place_cross_side_route_active": 0,
             "place_reapproach_count": 0,
             "recovery_branch": "",
             "recovery_branch_retry": 0,
@@ -584,6 +650,10 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             "retry_count": 0,
             "last_retry_reason": "",
             "failure_reason": "",
+            "phase_event": "",
+            "phase_event_class": "",
+            "task_switch_event": "",
+            "requested_task_intent": "PICK",
             "belief_update_backend": "python_init",
             "rxinfer_enabled": int(bool(rxinfer_enabled)),
             "rxinfer_available": int(bool(_RXINFER_JULIA_AVAILABLE and not _RXINFER_RUNTIME_DISABLED)),
@@ -653,6 +723,9 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     obj_yaw_obs = float(observation.get("o_obj_yaw", 0.0))
     if not np.isfinite(obj_yaw_obs):
         obj_yaw_obs = 0.0
+    ee_yaw_obs = float(observation.get("o_ee_yaw", previous_belief.get("s_ee_yaw", 0.0)))
+    if not np.isfinite(ee_yaw_obs):
+        ee_yaw_obs = 0.0
     obj_jump = np.linalg.norm(obj_obs - prev_obj)
     alpha_obj = alpha_obj_reach if prev_phase == "Reach" else alpha_obj_default
     if obj_jump > obj_reacquire_jump:
@@ -781,6 +854,19 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     place_yaw_ok = (not place_goal_yaw_enabled) or (
         place_yaw_error <= place_goal_yaw_threshold
     )
+    pick_yaw_target = _wrap_to_pi(float(obj_yaw_obs) + 0.5 * np.pi)
+    align_pick_yaw_error = float(
+        abs(
+            _yaw_error(
+                current_yaw=ee_yaw_obs,
+                desired_yaw=pick_yaw_target,
+                pi_symmetric=True,
+            )
+        )
+    )
+    align_pick_yaw_ok = (not align_pick_yaw_gate_enabled) or (
+        align_pick_yaw_error <= align_pick_yaw_threshold
+    )
 
     # Contact hysteresis to avoid sticky/latched grasp state.
     contact_counter = previous_belief.get("contact_counter", 0)
@@ -816,6 +902,9 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     descend_best_error = float(previous_belief.get("descend_best_error", float("inf")))
     descend_no_progress_steps = int(previous_belief.get("descend_no_progress_steps", 0))
     descend_timeout_extensions = int(previous_belief.get("descend_timeout_extensions", 0))
+    descend_watchdog_active = int(previous_belief.get("descend_watchdog_active", 0))
+    descend_watchdog_timer = int(previous_belief.get("descend_watchdog_timer", 0))
+    descend_misaligned_contact = int(previous_belief.get("descend_misaligned_contact", 0))
     close_hold_timer = int(previous_belief.get("close_hold_timer", 0))
     lift_test_timer = int(previous_belief.get("lift_test_timer", 0))
     transit_timer = int(previous_belief.get("transit_timer", 0))
@@ -831,6 +920,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     align_gate_active = int(previous_belief.get("align_gate_active", 0))
     align_gate_counter = int(previous_belief.get("align_gate_counter", 0))
     align_settle_counter = int(previous_belief.get("align_settle_counter", 0))
+    align_yaw_ok_counter = int(previous_belief.get("align_yaw_ok_counter", 0))
     descend_gate_active = int(previous_belief.get("descend_gate_active", 0))
     descend_gate_counter = int(previous_belief.get("descend_gate_counter", 0))
     descend_yaw_enabled = int(previous_belief.get("descend_yaw_enabled", 0))
@@ -842,10 +932,13 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     preplace_best_error = float(previous_belief.get("preplace_best_error", float("inf")))
     preplace_no_progress_steps = int(previous_belief.get("preplace_no_progress_steps", 0))
     preplace_timeout_extensions = int(previous_belief.get("preplace_timeout_extensions", 0))
+    place_cross_side_route_active = int(previous_belief.get("place_cross_side_route_active", 0))
     place_reapproach_count = int(previous_belief.get("place_reapproach_count", 0))
     recovery_branch = str(previous_belief.get("recovery_branch", ""))
     recovery_branch_retry = int(previous_belief.get("recovery_branch_retry", 0))
     recovery_global_count = int(previous_belief.get("recovery_global_count", 0))
+    prev_last_retry_reason = str(previous_belief.get("last_retry_reason", ""))
+    prev_failure_reason = str(previous_belief.get("failure_reason", ""))
     last_retry_reason = str(previous_belief.get("last_retry_reason", ""))
     failure_reason = str(previous_belief.get("failure_reason", ""))
     lift_test_ref_obj_rel = np.array(
@@ -884,6 +977,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
     align_gate_stable_steps = 2
     descend_gate_stable_steps = 3
     align_settle_steps = max(1, int(align_settle_steps))
+    align_pick_yaw_threshold = max(0.0, float(align_pick_yaw_threshold))
 
     if phase == "Reach":
         if reach_gate_active == 1:
@@ -987,6 +1081,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             align_gate_active = 0
             align_gate_counter = 0
             align_settle_counter = 0
+            align_yaw_ok_counter = 0
             descend_gate_active = 0
             descend_gate_counter = 0
             descend_yaw_enabled = 0
@@ -1009,18 +1104,32 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             align_settle_counter += 1
         else:
             align_settle_counter = 0
+        if align_pick_yaw_ok:
+            align_yaw_ok_counter += 1
+        else:
+            align_yaw_ok_counter = 0
 
         align_ready = (
             align_timer >= align_min_steps
             and align_gate_counter >= align_gate_stable_steps
         )
         settle_ready = align_settle_counter >= align_settle_steps
+        yaw_ready = (not align_pick_yaw_gate_enabled) or (
+            align_yaw_ok_counter >= align_pick_yaw_hold_steps
+        )
         align_timeout = align_timer >= align_max_steps
         align_timeout_near = align_error <= align_exit_threshold
-        if align_ready and settle_ready and align_error < align_threshold and phase_gate_ok:
+        if (
+            align_ready
+            and settle_ready
+            and yaw_ready
+            and align_error < align_threshold
+            and phase_gate_ok
+        ):
             phase = "Descend"
             last_retry_reason = ""
             align_settle_counter = 0
+            align_yaw_ok_counter = 0
             grasp_timer = 0
             stable_grasp_counter = 0
             descend_timer = 0
@@ -1036,10 +1145,11 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         elif align_timeout:
             # Timeout fallback: continue only when still near and gripper is open-ready.
             # Otherwise retry Reach to avoid entering a long hold stall.
-            if align_timeout_near and settle_ready and phase_gate_ok:
+            if align_timeout_near and settle_ready and yaw_ready and phase_gate_ok:
                 phase = "Descend"
                 last_retry_reason = ""
                 align_settle_counter = 0
+                align_yaw_ok_counter = 0
                 grasp_timer = 0
                 stable_grasp_counter = 0
                 descend_timer = 0
@@ -1068,6 +1178,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
                 align_gate_active = 0
                 align_gate_counter = 0
                 align_settle_counter = 0
+                align_yaw_ok_counter = 0
                 descend_gate_active = 0
                 descend_gate_counter = 0
                 descend_yaw_enabled = 0
@@ -1106,6 +1217,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             (descend_error <= descend_threshold and descend_gate_counter >= 2)
             or (descend_gate_counter >= descend_gate_stable_steps)
         )
+        descend_misaligned_contact = int(observation["o_contact"] == 1 and not xy_enter_ok)
 
         if not np.isfinite(descend_best_error):
             descend_best_error = descend_error
@@ -1115,6 +1227,18 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             descend_no_progress_steps = 0
         else:
             descend_no_progress_steps += 1
+
+        if descend_watchdog_misaligned_contact and descend_misaligned_contact == 1:
+            descend_watchdog_active = 1
+            descend_watchdog_timer = max(descend_watchdog_timer, descend_watchdog_hold_steps)
+        elif descend_no_progress_steps >= descend_watchdog_trigger_steps:
+            descend_watchdog_active = 1
+            descend_watchdog_timer = max(descend_watchdog_timer, descend_watchdog_hold_steps)
+
+        if descend_watchdog_active == 1:
+            descend_watchdog_timer = max(0, descend_watchdog_timer - 1)
+            if descend_watchdog_timer <= 0:
+                descend_watchdog_active = 0
 
         timeout_hit = descend_timer >= descend_max_steps
         timeout_near = (
@@ -1161,6 +1285,9 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             descend_best_error = float("inf")
             descend_no_progress_steps = 0
             descend_timeout_extensions = 0
+            descend_watchdog_active = 0
+            descend_watchdog_timer = 0
+            descend_misaligned_contact = 0
             close_hold_timer = 0
             lift_test_timer = 0
             release_contact_counter = 0
@@ -1319,6 +1446,14 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         reach_yaw_align_done = 0
         preplace_timer += 1
         err = s_target_mean - preplace_target_rel
+        preplace_goal_world_xy = np.asarray(s_ee_mean[:2], dtype=float) + np.asarray(err[:2], dtype=float)
+        cross_side_route_active = bool(
+            bool(place_cross_side_via_enabled)
+            and abs(float(s_ee_mean[0])) >= float(place_cross_side_x_gate)
+            and abs(float(preplace_goal_world_xy[0])) >= float(place_cross_side_x_gate)
+            and (float(s_ee_mean[0]) * float(preplace_goal_world_xy[0]) < 0.0)
+        )
+        place_cross_side_route_active = int(cross_side_route_active)
         preplace_err = float(np.linalg.norm(err))
         preplace_xy_err = float(np.linalg.norm(err[:2]))
         preplace_z_err = abs(float(err[2]))
@@ -1345,13 +1480,18 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         )
         can_extend = (
             timeout_hit
-            and not timeout_near
             and preplace_timeout_extensions < preplace_max_timeout_extensions
             and preplace_no_progress_steps < preplace_stall_steps
         )
 
         if holding_for_yaw:
             # Pause watchdog while preplace pose is good and we are only finishing yaw.
+            preplace_timer = max(0, preplace_timer - 1)
+            preplace_no_progress_steps = 0
+            preplace_best_error = min(preplace_best_error, preplace_err)
+        elif cross_side_route_active:
+            # Allow cross-side routing to complete without preplace watchdog
+            # prematurely classifying it as local alignment failure.
             preplace_timer = max(0, preplace_timer - 1)
             preplace_no_progress_steps = 0
             preplace_best_error = min(preplace_best_error, preplace_err)
@@ -1369,6 +1509,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             preplace_best_error = float("inf")
             preplace_no_progress_steps = 0
             preplace_timeout_extensions = 0
+            place_cross_side_route_active = 0
             place_reapproach_count = 0
         elif can_extend:
             preplace_timeout_extensions += 1
@@ -1381,6 +1522,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             preplace_best_error = float("inf")
             preplace_no_progress_steps = 0
             preplace_timeout_extensions = 0
+            place_cross_side_route_active = 0
             if place_reapproach_count > place_reapproach_max_retries:
                 phase = "Failure"
                 failure_reason = "place_alignment_failed"
@@ -1404,6 +1546,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
             preplace_best_error = float("inf")
             preplace_no_progress_steps = 0
             preplace_timeout_extensions = 0
+            place_cross_side_route_active = 0
     elif phase == "DescendToPlace":
         reach_turn_sign = 0
         reach_best_error = float("inf")
@@ -1434,7 +1577,6 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         )
         can_extend = (
             timeout_hit
-            and not timeout_near
             and place_descend_timeout_extensions < place_descend_max_timeout_extensions
             and place_descend_no_progress_steps < place_descend_stall_steps
         )
@@ -1626,6 +1768,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         preplace_best_error = float("inf")
         preplace_no_progress_steps = 0
         preplace_timeout_extensions = 0
+        place_cross_side_route_active = 0
 
     if phase in ("Reach", "Align", "Descend", "CloseHold", "LiftTest", "Failure", "Done"):
         place_reapproach_count = 0
@@ -1640,21 +1783,57 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         align_gate_active = 0
         align_gate_counter = 0
         align_settle_counter = 0
+        align_yaw_ok_counter = 0
     if phase != "Descend":
         descend_gate_active = 0
         descend_gate_counter = 0
         descend_yaw_enabled = 0
+        descend_watchdog_active = 0
+        descend_watchdog_timer = 0
+        descend_misaligned_contact = 0
 
     if phase in ("Reach", "Align", "Descend", "CloseHold", "LiftTest", "Transit", "MoveToPlaceAbove", "DescendToPlace"):
         # Ensure lift-test reference remains defined across non-done phases.
         if lift_test_ref_obj_rel is None:
             lift_test_ref_obj_rel = s_obj_mean.copy()
 
+    phase_event = ""
+    phase_event_class = ""
+    task_switch_event = ""
+
+    reason_changed = bool(last_retry_reason) and (str(last_retry_reason) != str(prev_last_retry_reason))
+    failure_changed = bool(failure_reason) and (str(failure_reason) != str(prev_failure_reason))
+    if reason_changed:
+        phase_event = str(last_retry_reason)
+        phase_event_class = _event_class_from_reason(phase_event)
+    if failure_changed:
+        phase_event = str(failure_reason)
+        phase_event_class = "terminal_failure"
+
+    # Place-side grasp loss should be surfaced as semantic task-switch event.
+    # Keep behavior unchanged (phase may already be set to Reach); this only
+    # provides explicit contract metadata for BT/router ownership.
+    if (
+        prev_phase in ("Transit", "MoveToPlaceAbove", "DescendToPlace")
+        and phase == "Reach"
+        and str(last_retry_reason) == "grasp_failed"
+    ):
+        phase_event = "object_dropped"
+        phase_event_class = "task_switch"
+        task_switch_event = "object_dropped"
+
+    requested_task_intent = (
+        "PICK"
+        if task_switch_event == "object_dropped"
+        else _task_intent_from_phase_name(phase)
+    )
+
     return {
         "s_ee_mean": s_ee_mean,
         "s_obj_mean": s_obj_mean,
         "s_target_mean": s_target_mean,
         "s_obj_yaw": float(obj_yaw_obs),
+        "s_ee_yaw": float(ee_yaw_obs),
         "reach_obj_rel_local": reach_obj_rel_local.copy(),
         "align_obj_rel_local": align_obj_rel_local.copy(),
         "descend_obj_rel_local": descend_obj_rel_local.copy(),
@@ -1662,6 +1841,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "reach_obj_rel": reach_obj_rel.copy(),
         "align_obj_rel": align_obj_rel.copy(),
         "descend_obj_rel": descend_obj_rel.copy(),
+        "align_pick_yaw_error": float(align_pick_yaw_error),
         "preplace_target_rel": preplace_target_rel.copy(),
         "place_target_rel": place_target_rel.copy(),
         "use_world_place_goal_pose": int(use_world_place_goal_pose),
@@ -1701,6 +1881,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "align_gate_active": int(align_gate_active),
         "align_gate_counter": int(align_gate_counter),
         "align_settle_counter": int(align_settle_counter),
+        "align_yaw_ok_counter": int(align_yaw_ok_counter),
         "descend_gate_active": int(descend_gate_active),
         "descend_gate_counter": int(descend_gate_counter),
         "descend_yaw_enabled": int(descend_yaw_enabled),
@@ -1722,6 +1903,9 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "descend_best_error": float(descend_best_error),
         "descend_no_progress_steps": int(descend_no_progress_steps),
         "descend_timeout_extensions": int(descend_timeout_extensions),
+        "descend_watchdog_active": int(descend_watchdog_active),
+        "descend_watchdog_timer": int(descend_watchdog_timer),
+        "descend_misaligned_contact": int(descend_misaligned_contact),
         "close_hold_timer": close_hold_timer,
         "lift_test_timer": lift_test_timer,
         "lift_test_ref_obj_rel": lift_test_ref_obj_rel,
@@ -1743,6 +1927,7 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "preplace_best_error": float(preplace_best_error),
         "preplace_no_progress_steps": int(preplace_no_progress_steps),
         "preplace_timeout_extensions": int(preplace_timeout_extensions),
+        "place_cross_side_route_active": int(place_cross_side_route_active),
         "place_reapproach_count": int(place_reapproach_count),
         "recovery_branch": str(recovery_branch),
         "recovery_branch_retry": int(recovery_branch_retry),
@@ -1756,6 +1941,10 @@ def infer_beliefs(observation, previous_belief=None, params=None):
         "retry_count": retry_count,
         "last_retry_reason": str(last_retry_reason),
         "failure_reason": str(failure_reason),
+        "phase_event": str(phase_event),
+        "phase_event_class": str(phase_event_class),
+        "task_switch_event": str(task_switch_event),
+        "requested_task_intent": str(requested_task_intent),
         "belief_update_backend": str(belief_update_backend),
         "rxinfer_enabled": int(bool(rxinfer_enabled)),
         "rxinfer_available": int(bool(_RXINFER_JULIA_AVAILABLE and not _RXINFER_RUNTIME_DISABLED)),

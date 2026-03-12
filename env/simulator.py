@@ -268,6 +268,7 @@ class MujocoSimulator:
         return {
             "sim_time": float(self.data.time),
             "ee_pos": ee_pos,
+            "ee_site_xmat": self.get_ee_orientation_matrix(),
             "obj_pos": obj_pos,
             "obj_quat_wxyz": self.get_object_orientation_quat(),
             "target_pos": target_pos,
@@ -283,6 +284,9 @@ class MujocoSimulator:
     # ------------------------------------------------
     def get_ee_position(self):
         return self.data.site_xpos[self.ee_site_id].copy()
+
+    def get_ee_orientation_matrix(self):
+        return np.array(self.data.site_xmat[self.ee_site_id], dtype=float).reshape(3, 3).copy()
 
     def get_mocap_position(self):
         return self.data.mocap_pos[self.mocap_id].copy()
